@@ -4,7 +4,6 @@
   gather_facts: false
 
   vars:
-    # [수정 완료] 다시 '노드 비우기' 전용 변수로 완벽하게 복구했습니다.
     source_node_input: "{{ survey_source_node | default('') }}"
     target_nodes_input: "{{ survey_target_nodes | default('') }}"
 
@@ -37,20 +36,14 @@
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 출발지 노드(src_node)에서 '실행 중'인 모든 리소스 추출
             all_res = proxmox.cluster.resources.get(type='vm')
             vms_to_move, node_vm_count = [], {}
             for res in all_res:
                 curr_node = res.get('node')
                 node_vm_count[curr_node] = node_vm_count.get(curr_node, 0) + 1
                 if curr_node == src_node and res.get('status') == 'running':
-                    vms_to_move.append({
-                        'vmid': str(res.get('vmid')), 
-                        'name': res.get('name'), 
-                        'type': res.get('type')
-                    })
+                    vms_to_move.append({'vmid': str(res.get('vmid')), 'name': res.get('name'), 'type': res.get('type')})
 
-            # 목적지 노드들의 부하(메모리+CPU+VM수) 계산
             nodes_info = proxmox.nodes.get()
             targets_scored = []
             for n in nodes_info:
@@ -60,7 +53,6 @@
                     targets_scored.append({'node': name, 'score': score})
             targets_scored.sort(key=lambda x: x['score'])
 
-            # 지능형 1:N 분산 계획
             plan = []
             for vm in vms_to_move:
                 if not targets_scored: break
@@ -82,7 +74,6 @@
         method: POST
         headers:
           Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        # [핵심] QEMU는 restart 제외(온라인), LXC는 restart 포함(재시작)하여 API 에러 원천 차단
         body: "{{ (item.type == 'qemu') | ternary({'target': item.target_node, 'online': 1}, {'target': item.target_node, 'online': 0, 'restart': 1}) }}"
         body_format: form-urlencoded
         validate_certs: false
@@ -101,7 +92,7 @@
         - item.json.data is none or item.json.data == ""
         - not item.get('skipped', false)
 
-    - name: "[단계 2] 실시간 위치 추적 및 최종 안착 검증"
+    - name: "[단계 2] 실시간 위치 추적 및 최종 안착 검증 (API 장애 방어 적용)"
       environment:
         ENV_PLAN: "{{ (evacuate_analysis_raw.stdout | from_json).plan | to_json }}"
       shell: |
@@ -118,18 +109,27 @@
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
         results, pending = [], {p['vmid']: p for p in plan}
-        for _ in range(120): # 최대 20분간 안전하게 추적
-            res = proxmox.cluster.resources.get(type='vm')
-            current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
-            done = [vmid for vmid, p in pending.items() if current.get(vmid) == p['target_node']]
-            for vmid in done:
-                results.append(f'- {vmid} ({pending[vmid][\"name\"]}): ✅ 완료')
-                del pending[vmid]
-            if not pending: break
+        current = {}
+        
+        # 최대 180회 (30분간) 안전하게 추적합니다.
+        for _ in range(180):
+            try:
+                # [핵심 보정] API 과부하 시 스크립트가 죽지 않도록 예외 처리
+                res = proxmox.cluster.resources.get(type='vm')
+                current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
+                
+                done = [vmid for vmid, p in pending.items() if current.get(vmid) == p['target_node']]
+                for vmid in done:
+                    results.append(f'- {vmid} ({pending[vmid][\"name\"]}): ✅ 완료')
+                    del pending[vmid]
+                if not pending: break
+            except Exception:
+                # Proxmox API가 무응답이어도 에러를 내지 않고 조용히 넘어갑니다.
+                pass
             time.sleep(10)
         
         for vmid, p in pending.items():
-            results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 (현재: {current.get(vmid, \"N/A\")})')
+            results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 또는 지연 (현재: {current.get(vmid, \"N/A\")})')
         print('\n'.join(results))
         "
       register: final_report
