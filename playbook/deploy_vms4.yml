@@ -27,8 +27,8 @@
         name: "KFE-VM-{{ item }}"
         full: true
         state: present
-      # 숫자로 변환된 변수를 사용하여 루프 실행 [cite: 2026-02-28]
-      loop: "{{ range(1, vm_count_int + 1) | list }}"
+      # [수정] 오류가 발생하던 연산식을 제거하고 직관적인 루프로 변경
+      loop: "{{ range(1, vm_count_int + 1) }}"
 
     - name: "[단계 2] 생성된 VM 전원 켜기"
       community.proxmox.proxmox_kvm:
@@ -40,4 +40,4 @@
         node: "xxhci01"
         name: "KFE-VM-{{ item }}"
         state: started
-      loop: "{{ range(1, vm_count_int + 1) | list }}"
+      loop: "{{ range(1, vm_count_int + 1) }}"
