@@ -1,5 +1,7 @@
 plugin: community.proxmox.proxmox
 validate_certs: true
+# CA 인증서 묶음 파일의 경로를 명시합니다. (방법 1의 마운트 경로와 일치해야 함)
+ca_path: /home/netko/ssl/TuringSignCA.pem
 want_proxmox_nodes_ansible_host: true
 group_by:
   - status
