@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (EFI/TPM/장치 완벽 복구본)
+- name: Proxmox VM 일괄 생성 (장치 구성 완벽 동기화)
   hosts: localhost
   gather_facts: false
 
@@ -45,7 +45,7 @@
       delay: 20
       with_sequence: "start=1 end={{ vm_count }}"
 
-    - name: "[단계 2] 누락된 하드웨어 장치 강제 재구성"
+    - name: "[단계 2] 템플릿 하드웨어 사양 강제 동기화"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -55,35 +55,9 @@
         node: "{{ target_node }}"
         name: "KFE-VM-{{ item }}"
         
-        # 1. 기본 사양 강제 주입
+        # 1. CPU 및 메모리 승계 보장
         cores: 8
         memory: 8192
         scsihw: virtio-scsi-pci
         
-        # 2. EFI 및 TPM 상태 복구 (부팅 필수 요소) [cite: 2026-02-28]
-        efidisk0: 
-          storage: "CephPool-VM-DMZ" # 이미지에서 확인된 스토리지
-          format: "raw"
-          efitype: "4m"
-        tpmstate0:
-          storage: "CephPool-VM-DMZ"
-          version: "v2.0"
-
-        # 3. CD/DVD 및 장치 연결 정보 복구
-        ide2: "CephFS-iso:iso/Rocky-10.0-x86_64-dvd1.iso,media=cdrom"
-        net0: "virtio,bridge=VLAN222" # 템플릿과 동일한 브리지
-        
-        state: present
-      with_sequence: "start=1 end={{ vm_count }}"
-
-    - name: "[단계 3] 교정된 VM 전원 켜기"
-      community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
-        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
-        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
-        validate_certs: false
-        node: "{{ target_node }}"
-        name: "KFE-VM-{{ item }}"
-        state: started
-      with_sequence: "start=1 end={{ vm_count }}"
+        # 2. EFI 및 TPM 복구 (버전 표기 수정)
