@@ -1,5 +1,5 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성 (VMID 다이렉트 매칭)
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (VMID 직접 지정 방식)
   hosts: localhost
   gather_facts: false
 
@@ -17,7 +17,7 @@
     
     # 템플릿 이름에서 숫자 106만 추출
     raw_template: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) | trim }}"
-    template_vmid: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') }}"
+    template_vmid: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
     
     selected_spec: "{{ (survey_vm_spec is iterable and survey_vm_spec is not string) | ternary(survey_vm_spec[0], survey_vm_spec) }}"
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
@@ -28,7 +28,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 시작"
+    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 시작 (VMID {{ template_vmid }} 사용)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -36,10 +36,13 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 템플릿이 위치한 노드
+        # 템플릿 106번이 위치한 xxhci00 노드 고정
         node: "xxhci00"   
-        # [핵심 변경] clone 대신 template 파라미터에 vmid를 넣어 검색 오류 방지
-        template: "{{ template_vmid }}"
+        
+        # [최종 변경] vmid 파라미터를 사용하여 원본 템플릿을 번호로 직접 지칭
+        vmid: "{{ template_vmid }}"
+        
+        # 새 VM이 생성될 목적지 노드
         target: "{{ target_node }}"
         
         name: "{{ vm_name_prefix }}-{{ item }}"
