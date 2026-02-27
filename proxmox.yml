@@ -1,0 +1,4 @@
+plugin: community.general.proxmox
+want_proxmox_nodes_ansible_host: true
+group_by:
+  - status
