@@ -1,9 +1,10 @@
 ---
-- name: Proxmox 노드 긴급 대피 (비동기 명령 및 지속 추적 검증형)
+- name: Proxmox 노드 긴급 대피 (공유 스토리지 기반 완벽 추적형)
   hosts: localhost
   gather_facts: false
 
   vars:
+    # AWX 설문조사 변수 (출발지 노드 단일 / 목적지 노드 다중 선택)
     source_node_input: "{{ survey_source_node | default('') }}"
     target_nodes_input: "{{ survey_target_nodes | default('') }}"
 
@@ -13,7 +14,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[분석] 출발지 VM 추출 및 목적지 부하 분산 계획 수립"
+    - name: "[분석] 출발지 리소스 추출 및 목적지 부하 분산 계획 수립"
       environment:
         ENV_SOURCE_NODE: "{{ source_node_input }}"
         ENV_TARGET_NODES: "{{ target_nodes_input | string }}"
@@ -26,8 +27,9 @@
         src_node = os.environ.get('ENV_SOURCE_NODE', '').strip()
         raw_targets = os.environ.get('ENV_TARGET_NODES', '')
         
+        # 목적지 노드 리스트 정제 (자기 자신 제외)
         cleaned_targets = raw_targets.replace('[', '').replace(']', '').replace('\'', '').replace('\"', '')
-        target_list = [n.strip() for n in cleaned_nodes.split(',') if n.strip() and n.strip() != src_node] if 'cleaned_nodes' in locals() else [n.strip() for n in cleaned_targets.split(',') if n.strip() and n.strip() != src_node]
+        target_list = [n.strip() for n in cleaned_targets.split(',') if n.strip() and n.strip() != src_node]
 
         try:
             url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
@@ -36,6 +38,7 @@
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
+            # 1. 클러스터 전체 리소스를 스캔하여 실행 중인 VM/LXC 식별
             all_res = proxmox.cluster.resources.get(type='vm')
             vms_to_move = []
             node_vm_count = {}
@@ -43,25 +46,43 @@
             for res in all_res:
                 curr_node = res.get('node')
                 node_vm_count[curr_node] = node_vm_count.get(curr_node, 0) + 1
+                
+                # 출발지 노드에서 실행(running) 중인 모든 리소스 대상
                 if curr_node == src_node and res.get('status') == 'running':
-                    vms_to_move.append({'vmid': str(res.get('vmid')), 'name': res.get('name'), 'type': res.get('type')})
+                    vms_to_move.append({
+                        'vmid': str(res.get('vmid')), 
+                        'name': res.get('name'), 
+                        'type': res.get('type')  # qemu 또는 lxc
+                    })
 
+            # 2. 타겟 노드들의 실시간 부하 스코어링 (CPU + RAM + VM수량)
             nodes_info = proxmox.nodes.get()
             targets_scored = []
             for n in nodes_info:
                 name = n.get('node')
                 if name in target_list and n.get('status') == 'online':
                     mem_score = n.get('mem', 0) / n.get('maxmem', 1) if n.get('maxmem', 0) > 0 else 1.0
-                    targets_scored.append({'node': name, 'score': mem_score + n.get('cpu', 1.0) + (node_vm_count.get(name, 0) * 0.05)})
+                    cpu_score = n.get('cpu', 1.0)
+                    vm_count_weight = node_vm_count.get(name, 0) * 0.05
+                    targets_scored.append({'node': name, 'score': mem_score + cpu_score + vm_count_weight})
 
+            # 부하가 적은 순서대로 정렬
             targets_scored.sort(key=lambda x: x['score'])
 
+            # 3. 라운드 로빈 방식으로 목적지 배정
             migration_plan = []
             for vm in vms_to_move:
                 if not targets_scored: break
-                best_target = targets_scored[0]
-                migration_plan.append({'vmid': vm['vmid'], 'name': vm['name'], 'source_node': src_node, 'target_node': best_target['node'], 'type': vm['type']})
-                best_target['score'] += 0.3
+                best = targets_scored[0]
+                migration_plan.append({
+                    'vmid': vm['vmid'], 
+                    'name': vm['name'], 
+                    'source_node': src_node, 
+                    'target_node': best['node'], 
+                    'type': vm['type']
+                })
+                # 배정 후 점수 보정하여 분산 유도
+                best['score'] += 0.3
                 targets_scored.sort(key=lambda x: x['score'])
 
             print(json.dumps({'plan': migration_plan}))
@@ -71,29 +92,33 @@
       register: evacuate_analysis_raw
       changed_when: false
 
-    - name: "[변수 설정] 계획 로드"
-      set_fact:
-        migration_plan: "{{ (evacuate_analysis_raw.stdout | from_json).plan | default([]) }}"
-
-    - name: "[단계 1] 마이그레이션 명령 전송 (비동기 처리)"
+    - name: "[단계 1] 마이그레이션 명령 전송 및 즉시 검증 (LXC/VM 대응)"
       uri:
+        # [핵심] type(qemu/lxc)에 따라 API 경로를 동적으로 변경합니다.
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/{{ item.type }}/{{ item.vmid }}/migrate"
         method: POST
         headers:
           Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        body: { target: "{{ item.target_node }}", online: 1 }
+        body:
+          target: "{{ item.target_node }}"
+          online: 1 # Live Migration 수행
         body_format: form-urlencoded
         validate_certs: false
-        status_code: 200
-      loop: "{{ migration_plan }}"
-      # [핵심] 명령만 던지고 결과를 기다리지 않음으로써 타임아웃 방지
-      async: 3600
-      poll: 0
-      register: async_results
+        status_code: [200, 500]
+        return_content: yes
+      loop: "{{ (evacuate_analysis_raw.stdout | from_json).plan | default([]) }}"
+      register: api_responses
 
-    - name: "[단계 2] 실시간 위치 추적 (목적지 도달 시까지 무한 대기)"
+    - name: "[오류 확인] UPID 생성 실패 시 즉시 중단"
+      fail:
+        msg: "리소스 {{ item.item.vmid }} 이동 명령 거부됨: {{ item.content }}"
+      loop: "{{ api_responses.results }}"
+      # API 응답에 작업 ID(data)가 없으면 실제 이동이 시작되지 않은 것입니다.
+      when: item.json is defined and (item.json.data is none or item.json.data == "")
+
+    - name: "[단계 2] 실시간 위치 추적 및 최종 안착 확인 (최대 20분)"
       environment:
-        ENV_MIGRATION_PLAN: "{{ migration_plan | to_json }}"
+        ENV_MIGRATION_PLAN: "{{ (evacuate_analysis_raw.stdout | from_json).plan | to_json }}"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
         import os, json, urllib3, time
@@ -107,38 +132,35 @@
         token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-        results = []
-        pending_vms = {p['vmid']: p for p in plan}
+        results, pending = [], {p['vmid']: p for p in plan}
         
-        # 최대 180회 (10초 간격 = 총 30분) 추적
-        for attempt in range(180):
+        # 10초 간격으로 최대 120회 추적
+        for _ in range(120):
             res = proxmox.cluster.resources.get(type='vm')
             current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
             
-            finished = []
-            for vmid, p in pending_vms.items():
-                if current.get(vmid) == p['target_node']:
-                    results.append(f'- VM {vmid} ({p[\"name\"]}): ✅ 완료 (목적지: {p[\"target_node\"]})')
-                    finished.append(vmid)
+            done = [vmid for vmid, p in pending.items() if current.get(vmid) == p['target_node']]
+            for vmid in done:
+                results.append(f'- {vmid} ({pending[vmid][\"name\"]}): ✅ 완료 (이동: {pending[vmid][\"target_node\"]})')
+                del pending[vmid]
             
-            for vmid in finished: del pending_vms[vmid]
-            if not pending_vms: break
+            if not pending: break
             time.sleep(10)
-
-        for vmid, p in pending_vms.items():
-            results.append(f'- VM {vmid} ({p[\"name\"]}): ❌ 실패 (시간 초과 / 현재 위치: {current.get(vmid, \"N/A\")})')
-
+        
+        for vmid, p in pending.items():
+            results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 (현재위치: {current.get(vmid, \"N/A\")})')
+        
         print('\n'.join(results))
         "
       register: final_report
-      when: migration_plan | length > 0
+      when: (evacuate_analysis_raw.stdout | from_json).plan | length > 0
       changed_when: false
 
-    - name: "[완료] 최종 결과 보고"
+    - name: "[완료] 노드 대피 최종 결과 보고"
       debug:
         msg: |
           ============================================================
-          🏁 노드 대피 작업 완료 리포트
+          🏁 노드 비우기(Evacuate) 최종 리포트
           ============================================================
-          {{ final_report.stdout | default('이동할 VM이 없습니다.') }}
+          {{ final_report.stdout | default('이동할 대상이 없었습니다.') }}
           ============================================================
