@@ -1,18 +1,18 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성 (데이터 타입 보정)
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (타입 에러 완전 해결)
   hosts: localhost
   gather_facts: false
   
   vars:
+    # 사양 매핑 테이블
     spec_map:
       "Small (1 core / 2GB)": { "cpu": 1, "ram": 2048 }
       "Medium (2 cores / 4GB)": { "cpu": 2, "ram": 4096 }
       "Large (4 cores / 8GB)": { "cpu": 4, "ram": 8192 }
 
-    # [수정] survey_vm_count를 확실하게 정수(int)로 변환합니다.
-    # 만약 값이 비어있을 경우를 대비해 default(1)를 함께 사용합니다.
-    vm_count: "{{ (survey_vm_count | default(1)) | int }}"
-    
+    # 설문 조사 변수 연결
+    # 루프에서 직접 계산하기 위해 여기서는 단순 할당만 합니다.
+    raw_vm_count: "{{ survey_vm_count | default('1') }}"
     vm_name_prefix: "{{ survey_vm_name_prefix }}"
     target_node: "{{ survey_target_node }}"
     template_name: "{{ survey_template_name }}"
@@ -20,7 +20,7 @@
     selected_vnet: "{{ survey_vm_vnet }}"
 
   tasks:
-    - name: "[생성] {{ vm_count }}대의 VM 복제 및 설정 시작"
+    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 및 설정 시작"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -38,5 +38,5 @@
         memory: "{{ spec_map[selected_spec].ram }}"
         netif: '{"net0":"virtio,bridge={{ selected_vnet }}"}'
         state: present
-      # [확인] 여기서 vm_count는 이제 확실한 숫자 타입입니다.
-      loop: "{{ range(1, vm_count + 1) | list }}"
+      # 핵심 수정: range 안에서 직접 정수 변환을 수행하여 연산 충돌 방지
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
