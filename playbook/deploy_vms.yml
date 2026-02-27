@@ -1,10 +1,10 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성 (문법 교정본)
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (전체 이름 매칭 방식)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 1. 매핑 테이블 및 변수 정의 (모두 위로 모음)
+    # 사양 매핑 테이블
     spec_map:
       "Small (1 core / 2GB)": { "cpu": 1, "ram": 2048 }
       "Medium (2 cores / 4GB)": { "cpu": 2, "ram": 4096 }
@@ -12,29 +12,31 @@
 
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
     vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
-    # 리스트 처리 및 기본값 설정
+    
+    # [교정] 리스트 형태로 들어오는 설문 응답을 순수 문자열로 변환
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    template_name: "{{ survey_template_name }}"
-    selected_spec: "{{ survey_vm_spec }}"
-    selected_vnet: "{{ survey_vm_vnet }}"
+    
+    # [수정] 템플릿 전체 이름을 그대로 사용 (정규표현식 제거)
+    template_full_name: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) }}"
+    
+    selected_spec: "{{ (survey_vm_spec is iterable and survey_vm_spec is not string) | ternary(survey_vm_spec[0], survey_vm_spec) }}"
+    selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
 
   tasks:
-    # 2. 작업 시작 (순차적으로 진행)
-    - name: "[준비] 필수 파이썬 라이브러리(proxmoxer) 즉시 설치"
+    - name: "[준비] 필수 파이썬 라이브러리 설치"
       pip:
-        name: 
-          - proxmoxer
-          - requests
+        name: [proxmoxer, requests]
         state: present
 
-    - name: "[확인] 입력된 변수 값 디버깅"
+    - name: "[확인] 입력 변수 최종 디버깅"
       debug:
         msg: 
-          - "선택된 사양: {{ selected_spec | default('N/A') }}"
-          - "최종 대상 노드: {{ target_node }}"
-          - "VNet: {{ selected_vnet }}"
+          - "원본 템플릿 이름: {{ template_full_name }}"
+          - "대상 노드: {{ target_node }}"
+          - "VNet 브리지: {{ selected_vnet }}"
+          - "선택 사양: {{ selected_spec }}"
 
-    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 및 설정 시작"
+    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 및 자동 시작"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -43,16 +45,16 @@
         validate_certs: false
         
         node: "{{ target_node }}"
-        clone: "{{ template_name }}"
+        clone: "{{ template_full_name }}" # 설문에서 선택한 전체 이름을 그대로 사용
         name: "{{ vm_name_prefix }}-{{ item }}"
         full: true
         timeout: 600
         
         cores: "{{ spec_map[selected_spec].cpu | default(2) }}"
         memory: "{{ spec_map[selected_spec].ram | default(4096) }}"
-        
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
         
         state: present
+        start: yes
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
