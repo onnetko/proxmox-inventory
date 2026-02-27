@@ -1,5 +1,5 @@
 ---
-- name: Proxmox 노드 긴급 대피 (LXC/VM 최적화 및 실시간 추적)
+- name: Proxmox 노드 긴급 대피 (LXC/VM 최적화 및 실시간 추적 완성형)
   hosts: localhost
   gather_facts: false
 
@@ -37,7 +37,6 @@
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 1. 출발지 노드 리소스 스캔
             all_res = proxmox.cluster.resources.get(type='vm')
             vms_to_move, node_vm_count = [], {}
             for res in all_res:
@@ -47,10 +46,9 @@
                     vms_to_move.append({
                         'vmid': str(res.get('vmid')), 
                         'name': res.get('name'), 
-                        'type': res.get('type') # qemu or lxc
+                        'type': res.get('type')
                     })
 
-            # 2. 목적지 부하 계산
             nodes_info = proxmox.nodes.get()
             targets_scored = []
             for n in nodes_info:
@@ -60,7 +58,6 @@
                     targets_scored.append({'node': name, 'score': score})
             targets_scored.sort(key=lambda x: x['score'])
 
-            # 3. 계획 수립
             plan = []
             for vm in vms_to_move:
                 if not targets_scored: break
@@ -69,10 +66,10 @@
                 best['score'] += 0.3
                 targets_scored.sort(key=lambda x: x['score'])
             
-            # 최종 결과 출력 (에러 방지를 위해 반드시 JSON만 출력)
+            # 오직 JSON 결과만 출력되도록 보장
             print(json.dumps({'plan': plan}))
         except Exception as e:
-            # 예외 발생 시에도 빈 plan 리스트를 담은 JSON을 반환하여 에러 방지
+            # 에러 발생 시에도 빈 리스트를 반환하여 Ansible의 JSONDecodeError 방지
             print(json.dumps({'plan': [], 'error': str(e)}))
         "
       register: evacuate_analysis_raw
@@ -86,8 +83,8 @@
           Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         body:
           target: "{{ item.target_node }}"
-          # [LXC 라이브 마이그레이션 미지원 해결] 
-          # VM은 온라인 유지(1), LXC는 재시작(online:0, restart:1)
+          # [LXC 라이브 마이그레이션 에러 해결]
+          # VM은 온라인 유지(1), LXC는 오프라인 전송 후 재시작(online:0, restart:1)
           online: "{{ '1' if item.type == 'qemu' else '0' }}"
           restart: "{{ '0' if item.type == 'qemu' else '1' }}"
         body_format: form-urlencoded
@@ -100,7 +97,7 @@
       poll: 0
       register: migrate_jobs
 
-    - name: "[단계 2] 실시간 위치 추적 및 최종 안착 확인"
+    - name: "[단계 2] 실시간 위치 추적 및 최종 안착 확인 (최대 20분)"
       environment:
         ENV_MIGRATION_PLAN: "{{ (evacuate_analysis_raw.stdout | from_json).plan | to_json }}"
       shell: |
@@ -109,7 +106,9 @@
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        plan = json.loads(os.environ.get('ENV_MIGRATION_PLAN', '[]'))
+        plan_raw = os.environ.get('ENV_MIGRATION_PLAN', '[]')
+        plan = json.loads(plan_raw)
+        
         url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
         user = os.environ.get('PROXMOX_USER', '')
         token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
@@ -117,7 +116,9 @@
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
         results, pending = [], {p['vmid']: p for p in plan}
-        for _ in range(120): # 최대 20분 추적
+        
+        # 10초 간격으로 최대 120회 추적
+        for _ in range(120):
             res = proxmox.cluster.resources.get(type='vm')
             current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
             done = [vmid for vmid, p in pending.items() if current.get(vmid) == p['target_node']]
@@ -128,7 +129,7 @@
             time.sleep(10)
         
         for vmid, p in pending.items():
-            results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 (현재: {current.get(vmid, \"N/A\")})')
+            results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 (현재위치: {current.get(vmid, \"N/A\")})')
         print('\n'.join(results))
         "
       register: final_report
@@ -139,7 +140,7 @@
       debug:
         msg: |
           ============================================================
-          🏁 노드 대피 최종 리포트
+          🏁 노드 대피 최종 리포트 (LXC 최적화 적용)
           ============================================================
           {{ final_report.stdout | default('이동할 대상이 없었습니다.') }}
           ============================================================
