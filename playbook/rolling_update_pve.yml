@@ -11,7 +11,6 @@
         upgrade: dist
         update_cache: yes
         autoremove: yes
-        # [핵심] 대화형 프롬프트에서 멈추지 않고, 안전하게 기존 설정(기본값)을 유지하도록 강제합니다.
         dpkg_options: 'force-confdef,force-confold'
       environment:
         DEBIAN_FRONTEND: noninteractive
@@ -30,14 +29,23 @@
         test_command: uptime
       when: reboot_required_file.stat.exists
 
+    - name: "[{{ inventory_hostname }}] 서비스 재시작 대비 SSH 연결 상태 안정화 대기"
+      # 업데이트 도중 네트워크나 SSH 데몬이 재시작되었을 경우를 대비해 연결을 재확인합니다.
+      wait_for_connection:
+        timeout: 300
+        delay: 5
+
     - name: "[{{ inventory_hostname }}] 클러스터 상태 정상 확인 (pvecm status)"
-      command: pvecm status
+      # 리눅스 네이티브 명령어(grep)를 사용하여 훨씬 더 안정적으로 상태를 추출합니다.
+      shell: pvecm status | grep -iE "Quorate:\s+Yes"
       register: pvecm_output
-      until: pvecm_output.stdout is search('Quorate:\s+Yes')
-      retries: 10
+      until: pvecm_output.rc == 0
+      # 클러스터 안정화 시간을 넉넉히 주기 위해 최대 5분(20번 * 15초)까지 대기합니다.
+      retries: 20
       delay: 15
       changed_when: false
-      # 재부팅을 했든 안 했든, 클러스터 헬스 체크는 무조건 수행하여 안정성을 보장합니다.
+      # 명령어 실행 중 코로싱크 재시작으로 인한 일시적 에러(rc != 0)를 무시하고 재시도합니다.
+      failed_when: pvecm_output.rc != 0 and pvecm_output.attempts == 20
 
     - name: "[{{ inventory_hostname }}] 노드 업데이트 완료"
       debug:
