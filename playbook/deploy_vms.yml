@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (라이브러리 및 복제 정상화)
+- name: Proxmox VM 일괄 생성 (ID 다이렉트 매칭)
   hosts: localhost
   gather_facts: false
 
@@ -7,7 +7,8 @@
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
     vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    template_vmid: 106  # Rocky 10 템플릿 ID
+    # 템플릿의 숫자 ID를 정수형으로 정의
+    template_id: 106 
 
   tasks:
     - name: "[준비] 필수 파이썬 라이브러리(proxmoxer) 즉시 설치"
@@ -17,7 +18,7 @@
           - requests
         state: present
 
-    - name: "[단계 1] VM 복제 생성 (오직 생성만 수행)"
+    - name: "[단계 1] VM 복제 생성 (VMID 기반)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -25,14 +26,21 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        node: "xxhci00"   # 원본 템플릿 위치
-        clone: "{{ template_vmid }}"
+        # 1. 템플릿이 위치한 노드
+        node: "xxhci00"   
+        
+        # 2. [핵심] clone 대신 vmid 파라미터에 숫자 ID를 넣어 이름 매칭 버그 우회
+        vmid: "{{ template_id }}"
+        
+        # 3. 생성될 대상 노드
         target: "{{ target_node }}"
         name: "{{ vm_name_prefix }}-{{ item }}"
+        
+        # 4. Full Clone 및 충분한 타임아웃
         full: true 
         timeout: 1800 
         
-        # [중요] present는 생성만 합니다. started를 쓰면 템플릿 실행 에러가 발생합니다.
+        # 5. 오직 생성(present)만 수행하여 템플릿 실행 에러 방지
         state: present
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
 
