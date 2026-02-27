@@ -1,7 +1,7 @@
 ---
 - name: Proxmox 클러스터 롤링 업데이트 및 순차 재부팅
   # [수정됨] 타겟을 XXHCI 그룹으로 한정하여 물리 노드만 바라보게 합니다.
-  hosts: XXHCI
+  hosts: XXHOSTS
   become: true
   # 한 번에 1대씩(00 -> 01 -> 02 -> 03 순서) 작업을 수행하도록 강제합니다.
   serial: 1 
