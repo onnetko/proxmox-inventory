@@ -1,0 +1,63 @@
+---
+- name: Proxmox VM 일괄 생성 (템플릿 하드웨어 사양 유지형)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    raw_vm_count: "{{ survey_vm_count | default('1') }}"
+    prefix: "{{ survey_vm_name_prefix | default('KFE-VM') }}"
+    target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
+    template_id: 106 
+
+  tasks:
+    - name: "[준비] 필수 파이썬 라이브러리 설치"
+      pip:
+        name: [proxmoxer, requests]
+        state: present
+
+    - name: "[단계 1] VM 복제 생성 (템플릿 사양 그대로 계승)"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "xxhci00"   
+        vmid: "{{ template_id }}"
+        target: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
+        
+        # [핵심] Full Clone을 수행하면 템플릿의 모든 하드웨어 설정이 복제됩니다.
+        # 사양(cores, memory 등)을 명시하지 않으면 템플릿 설정을 유지합니다.
+        full: true 
+        timeout: 1800 
+        state: present
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    - name: "[대기] 복제 완료 및 VM 등록 확인"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
+        state: present
+      register: vm_check
+      until: vm_check is success
+      retries: 30
+      delay: 15 # Full Clone 시간이 걸리므로 대기 시간을 늘림
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    - name: "[단계 2] 신규 VM 전원 켜기"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
+        state: started
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
