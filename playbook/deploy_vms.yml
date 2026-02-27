@@ -2,6 +2,21 @@
 - name: Proxmox 템플릿 기반 VM 일괄 생성 (파라미터 교정본)
   hosts: localhost
   gather_facts: false
+
+tasks:
+    - name: "[준비] 필수 파이썬 라이브러리(proxmoxer) 즉시 설치"
+      pip:
+        name: 
+          - proxmoxer
+          - requests
+        state: present
+
+    - name: "[확인] 입력된 변수 값 디버깅"
+      debug:
+        msg: 
+          - "선택된 사양: {{ selected_spec | default('Small (1 core / 2GB)') }}"
+          - "최종 대상 노드: {{ target_node | default('xxhci01') }}"
+          - "VNet: {{ selected_vnet | default('') }}"
   
   vars:
     spec_map:
