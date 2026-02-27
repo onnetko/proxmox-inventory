@@ -1,38 +1,45 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (Full 드롭다운 방식)
   hosts: localhost
   gather_facts: false
   
   vars:
-    # AWX 설문조사에서 받을 변수들 (기본값 설정)
-    vm_count: "{{ survey_vm_count | default(1) }}"
-    vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
-    vm_vcpu: "{{ survey_vm_vcpu | default(2) }}"
-    vm_ram: "{{ survey_vm_ram | default(2048) }}"
-    vm_vlan: "{{ survey_vm_vlan | default('') }}"
-    target_node: "{{ survey_target_node | default('xxhci01') }}"
+    # 1. 사양 선택 결과에 따른 CPU/RAM 매핑 테이블
+    spec_map:
+      "Small (1 core / 2GB)": { "cpu": 1, "ram": 2048 }
+      "Medium (2 cores / 4GB)": { "cpu": 2, "ram": 4096 }
+      "Large (4 cores / 8GB)": { "cpu": 4, "ram": 8192 }
+
+    # 2. 설문 조사(Survey)에서 넘어온 변수들
+    vm_count: "{{ survey_vm_count | int }}"
+    vm_name_prefix: "{{ survey_vm_name_prefix }}"
+    target_node: "{{ survey_target_node }}"
     template_name: "{{ survey_template_name }}"
+    selected_spec: "{{ survey_vm_spec }}"
+    selected_vnet: "{{ survey_vm_vnet }}"
 
   tasks:
-    - name: "[생성] {{ vm_count }}대의 가상머신 복제 및 설정 시작"
+    - name: "[생성] 선택한 사양으로 VM 복제 및 설정 시작"
       community.proxmox.proxmox_kvm:
-        # 인증 정보는 Credential에서 환경변수로 주입됨
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 클론 및 설정
+        # 템플릿 및 대상 설정
         node: "{{ target_node }}"
         clone: "{{ template_name }}"
         name: "{{ vm_name_prefix }}-{{ item }}"
-        full: true # Full Clone 방식
-        timeout: 500
+        full: true
+        timeout: 600
         
-        # 동적 설정 변경
-        cores: "{{ vm_vcpu }}"
-        memory: "{{ vm_ram }}"
-        netif: '{"net0":"virtio,bridge=vmbr0{{ (vm_vlan != "") | ternary(",tag=" + vm_vlan, "") }}"}'
+        # 드롭다운에서 선택한 사양 적용
+        cores: "{{ spec_map[selected_spec].cpu }}"
+        memory: "{{ spec_map[selected_spec].ram }}"
+        
+        # SDN VNet 적용
+        netif: '{"net0":"virtio,bridge={{ selected_vnet }}"}'
+        
         state: present
-      loop: "{{ range(1, vm_count | int + 1) | list }}"
+      loop: "{{ range(1, vm_count + 1) | list }}"
