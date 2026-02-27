@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (들여쓰기 및 하드웨어 동기화 최종)
+- name: Proxmox VM 일괄 생성 (파라미터 그룹화 완벽 교정)
   hosts: localhost
   gather_facts: false
 
@@ -28,7 +28,6 @@
         name: "KFE-VM-{{ item }}"
         full: true
         state: present
-      # [주의] 들여쓰기가 community.proxmox.proxmox_kvm 과 동일한 레벨이어야 합니다.
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
 
     - name: "[대기] 복제 완료 확인"
@@ -56,7 +55,6 @@
         node: "{{ target_node }}"
         name: "KFE-VM-{{ item }}"
         
-        # [핵심] 기존 VM을 업데이트 하겠다는 명시적 선언
         update: true
         
         # 1. 기본 사양 강제 주입
@@ -64,7 +62,7 @@
         memory: 8192
         scsihw: virtio-scsi-pci
         
-        # 2. EFI 및 TPM 복구
+        # 2. EFI 및 TPM 복구 (모듈 최상위 지원 파라미터)
         efidisk0: 
           storage: "CephPool-VM-DMZ"
           format: "raw"
@@ -73,9 +71,11 @@
           storage: "CephPool-VM-DMZ"
           version: "2.0"
 
-        # 3. CD/DVD 및 네트워크 장치 복구
-        ide2: "CephFS-iso:iso/Rocky-10.0-x86_64-dvd1.iso,media=cdrom"
-        net0: "virtio,bridge=VLAN222"
+        # 3. [교정] CD/DVD 및 네트워크 장치 그룹화
+        ide:
+          ide2: "CephFS-iso:iso/Rocky-10.0-x86_64-dvd1.iso,media=cdrom"
+        net:
+          net0: "virtio,bridge=VLAN222"
         
         state: present
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
