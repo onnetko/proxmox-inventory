@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 복제 (비동기 병렬 처리, 타임아웃 완벽 해결)
+- name: Proxmox VM 일괄 복제 (비동기 병렬 처리 및 지능형 네이밍)
   hosts: localhost
   gather_facts: false
 
@@ -32,11 +32,15 @@
             search_target = '{{ search_target }}'
             source_node = 'xxhci00'
             actual_name = search_target
+            # [추가] 원본 VM의 ID를 담을 변수를 초기화합니다.
+            source_vmid = '000' 
             
             for vm in proxmox.cluster.resources.get(type='vm'):
                 if str(vm.get('vmid')) == search_target or vm.get('name') == search_target or str(vm.get('vmid')) in search_target:
                     source_node = vm.get('node')
                     actual_name = vm.get('name')
+                    # [추가] 찾은 원본의 실제 VM ID를 추출합니다.
+                    source_vmid = str(vm.get('vmid')) 
                     break
 
             nodes = proxmox.nodes.get()
@@ -51,26 +55,30 @@
             print(json.dumps({
                 'source_node': source_node, 
                 'target_node': target_node, 
-                'actual_template_name': actual_name
+                'actual_template_name': actual_name,
+                # [추가] JSON 결과에 원본 ID를 포함하여 앤서블로 넘깁니다.
+                'source_vmid': source_vmid 
             }))
             
         except Exception as e:
-            print(json.dumps({'error': str(e), 'source_node': 'xxhci00', 'target_node': 'xxhci01', 'actual_template_name': '{{ search_target }}'}))
+            print(json.dumps({'error': str(e), 'source_node': 'xxhci00', 'target_node': 'xxhci01', 'actual_template_name': '{{ search_target }}', 'source_vmid': '000'}))
         "
       register: cluster_info_raw
       changed_when: false
 
-    - name: "[변수 설정] 분석된 지능형 노드 정보 적용"
+    - name: "[변수 설정] 분석된 지능형 노드 및 ID 정보 적용"
       set_fact:
         dynamic_source_node: "{{ (cluster_info_raw.stdout | from_json).source_node }}"
         dynamic_target_node: "{{ (cluster_info_raw.stdout | from_json).target_node }}"
         dynamic_template_name: "{{ (cluster_info_raw.stdout | from_json).actual_template_name }}"
+        # [추가] 앤서블 변수로 원본 ID를 등록합니다.
+        dynamic_source_vmid: "{{ (cluster_info_raw.stdout | from_json).source_vmid }}" 
 
     - name: "[알림] 분석된 클러스터 배치 계획 출력"
       debug:
-        msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_template_name }}' ➡️ 🎯 대상(최적 노드): [{{ dynamic_target_node }}]"
+        msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_source_vmid }} ({{ dynamic_template_name }})' ➡️ 🎯 대상(최적 노드): [{{ dynamic_target_node }}]"
 
-    - name: "[단계 1] 복제 명령 일괄 전송 (네트워크 끊김 방지)"
+    - name: "[단계 1] 복제 명령 일괄 전송 (네트워크 끊김 방지 및 네이밍 적용)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -82,13 +90,14 @@
         clone: "{{ dynamic_template_name }}"
         target: "{{ dynamic_target_node }}"
         
-        name: "KFE-VM-{{ item }}"
+        # [핵심 교정] 원본ID-KFE-VM-순번 형태로 이름을 동적 생성합니다 (예: 101-KFE-VM-1).
+        name: "{{ dynamic_source_vmid }}-KFE-VM-{{ item }}"
+        
         full: true
         timeout: 3600
         state: present
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
       
-      # [핵심] 명령을 순차적으로 기다리지 않고 백그라운드로 동시에 던집니다.
       async: 3600
       poll: 0
       register: clone_jobs
@@ -98,7 +107,6 @@
         jid: "{{ item.ansible_job_id }}"
       register: job_result
       until: job_result.finished
-      # 15초마다 한 번씩 최대 240번(1시간) 물어봅니다.
       retries: 240
       delay: 15
       loop: "{{ clone_jobs.results }}"
