@@ -1,10 +1,9 @@
 ---
-- name: Proxmox VM 지능형 마이그레이션 (부하 분산 적용)
+- name: Proxmox VM 지능형 마이그레이션 (부하 분산 및 무중단 적용)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 설문조사 변수 (AWX 설정에 맞게 변수명을 매핑해주세요)
     survey_vm_ids: "{{ survey_target_vms | default('') }}"
     survey_target_nodes: "{{ survey_target_hosts | default('') }}"
 
@@ -15,18 +14,22 @@
         state: present
 
     - name: "[분석] 대상 VM 위치 확인 및 타겟 노드 부하 분석"
+      # [핵심 교정 1] 따옴표 충돌을 막기 위해 AWX 설문 변수를 환경 변수로 안전하게 넘깁니다.
+      environment:
+        ENV_RAW_VMS: "{{ survey_vm_ids }}"
+        ENV_RAW_NODES: "{{ survey_target_nodes | string }}"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
         import os, json, urllib3
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        raw_vms = '{{ survey_vm_ids }}'
-        raw_nodes = '{{ survey_target_nodes }}'
+        # 환경 변수에서 안전하게 값을 받아옵니다.
+        raw_vms = os.environ.get('ENV_RAW_VMS', '')
+        raw_nodes = os.environ.get('ENV_RAW_NODES', '')
         
         target_vmid_list = [v.strip() for v in raw_vms.split(',') if v.strip().isdigit()]
         
-        # 다중 선택된 타겟 노드 리스트 파싱 (JSON 배열 형태나 쉼표 문자열 모두 대응)
         cleaned_nodes = raw_nodes.replace('[', '').replace(']', '').replace('\'', '').replace('\"', '')
         target_node_list = [n.strip() for n in cleaned_nodes.split(',') if n.strip()]
 
@@ -41,7 +44,6 @@
 
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 1. 클러스터 전체 리소스를 스캔하여 노드별 VM 수량과 원본 위치 파악
             resources = proxmox.cluster.resources.get()
             node_vm_count = {}
             vms_info = {}
@@ -54,7 +56,6 @@
                     if vmid in target_vmid_list:
                         vms_info[vmid] = {'node': node, 'name': res.get('name')}
 
-            # 2. 선택된 타겟 노드들의 상태(CPU, RAM, VM수량) 분석
             nodes = proxmox.nodes.get()
             available_targets = []
             
@@ -63,16 +64,13 @@
                 if node_name in target_node_list and n.get('status') == 'online':
                     mem_pct = n.get('mem', 0) / n.get('maxmem', 1) if n.get('maxmem', 0) > 0 else 1.0
                     cpu_pct = n.get('cpu', 1.0)
-                    vm_count_weight = node_vm_count.get(node_name, 0) * 0.05  # VM 1개당 5% 부하 가중치 부여
+                    vm_count_weight = node_vm_count.get(node_name, 0) * 0.05
                     
-                    # 통합 부하 스코어 (낮을수록 한가함)
                     score = mem_pct + cpu_pct + vm_count_weight
                     available_targets.append({'node': node_name, 'score': score})
 
-            # 부하가 적은 순으로 정렬
             available_targets.sort(key=lambda x: x['score'])
 
-            # 3. 마이그레이션 대상별 최적의 노드 할당
             for vmid in target_vmid_list:
                 if vmid not in vms_info:
                     skipped_plan.append({'vmid': vmid, 'reason': '클러스터에서 VM을 찾을 수 없음'})
@@ -85,11 +83,9 @@
                     skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': '사용 가능한 타겟 노드 없음'})
                     continue
 
-                # 가장 부하가 적은 1등 노드 선택
                 best_target = available_targets[0]
                 dest_node = best_target['node']
 
-                # 이미 타겟 노드에 있으면 건너뜀
                 if src_node == dest_node:
                     skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': f'이미 목적지({dest_node})에 위치함'})
                     continue
@@ -101,7 +97,6 @@
                     'target_node': dest_node
                 })
                 
-                # [핵심] 할당된 노드에 가상의 부하(0.5)를 더해 다음 VM은 다른 노드로 분산되도록 유도
                 best_target['score'] += 0.5 
                 available_targets.sort(key=lambda x: x['score'])
 
@@ -140,23 +135,23 @@
           {% endfor %}
           ============================================================
 
-    - name: "[단계 1] 백그라운드 마이그레이션 실행 (무중단/비동기)"
-      community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
-        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
-        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+    - name: "[단계 1] 백그라운드 마이그레이션 실행 (API 무중단 호출)"
+      # [핵심 교정 2] 모듈의 한계를 피해 Proxmox API를 직접 호출하여 완벽한 Live Migration을 수행합니다.
+      uri:
+        url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/qemu/{{ item.vmid }}/migrate"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        body_format: form-urlencoded
+        body:
+          target: "{{ item.target_node }}"
+          online: 1
         validate_certs: false
-        
-        node: "{{ item.source_node }}"
-        vmid: "{{ item.vmid }}"
-        target: "{{ item.target_node }}"
-        
-        # [핵심] 복제가 아닌 마이그레이션 명령어 호출
-        migrate: true
-        
+        status_code: 200
       loop: "{{ migration_plan }}"
       when: migration_plan | length > 0
+      
+      # 비동기 병렬 처리로 AWX 화면 멈춤을 방지합니다.
       async: 3600
       poll: 0
       register: migrate_jobs
@@ -169,4 +164,4 @@
       retries: 240
       delay: 15
       loop: "{{ migrate_jobs.results | default([]) }}"
-      when: migrate_jobs.results is defined
+      when: migrate_jobs.results is defined and item.ansible_job_id is defined
