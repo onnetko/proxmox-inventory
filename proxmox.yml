@@ -1,4 +1,5 @@
-plugin: community.general.proxmox
+# 기존: plugin: community.general.proxmox
+plugin: community.proxmox.proxmox
 want_proxmox_nodes_ansible_host: true
 group_by:
   - status
