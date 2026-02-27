@@ -1,0 +1,174 @@
+---
+- name: Proxmox 노드 긴급 대피 (유지보수용 모든 VM 마이그레이션)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # AWX 설문조사 변수 매핑
+    source_node_input: "{{ survey_source_node | default('') }}"
+    target_nodes_input: "{{ survey_target_nodes | default('') }}"
+
+  tasks:
+    - name: "[준비] 필수 라이브러리 설치"
+      pip:
+        name: [proxmoxer, requests]
+        state: present
+
+    - name: "[분석] 출발지 VM 추출 및 목적지 부하 분산 계획 수립"
+      environment:
+        ENV_SOURCE_NODE: "{{ source_node_input }}"
+        ENV_TARGET_NODES: "{{ target_nodes_input | string }}"
+      shell: |
+        {{ ansible_python_interpreter | default('python3') }} -c "
+        import os, json, urllib3
+        from proxmoxer import ProxmoxAPI
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        src_node = os.environ.get('ENV_SOURCE_NODE', '').strip()
+        raw_targets = os.environ.get('ENV_TARGET_NODES', '')
+        
+        # 목적지 노드 리스트 정제
+        cleaned_targets = raw_targets.replace('[', '').replace(']', '').replace('\'', '').replace('\"', '')
+        target_list = [n.strip() for n in cleaned_targets.split(',') if n.strip() and n.strip() != src_node]
+
+        try:
+            url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
+            user = os.environ.get('PROXMOX_USER', '')
+            token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
+            token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
+            proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
+
+            # 1. 출발지 노드에서 실행 중인 VM만 찾기
+            all_res = proxmox.cluster.resources.get(type='vm')
+            vms_to_move = []
+            node_vm_count = {}
+
+            for res in all_res:
+                curr_node = res.get('node')
+                node_vm_count[curr_node] = node_vm_count.get(curr_node, 0) + 1
+                
+                if curr_node == src_node and res.get('status') == 'running':
+                    vms_to_move.append({
+                        'vmid': str(res.get('vmid')),
+                        'name': res.get('name'),
+                        'type': res.get('type') # qemu or lxc
+                    })
+
+            # 2. 목적지 노드들의 부하 상태 분석 (Score 낮은 순 정렬)
+            nodes_info = proxmox.nodes.get()
+            targets_scored = []
+            for n in nodes_info:
+                name = n.get('node')
+                if name in target_list and n.get('status') == 'online':
+                    mem_score = n.get('mem', 0) / n.get('maxmem', 1) if n.get('maxmem', 0) > 0 else 1.0
+                    cpu_score = n.get('cpu', 1.0)
+                    cnt_score = node_vm_count.get(name, 0) * 0.05
+                    targets_scored.append({'node': name, 'score': mem_score + cpu_score + cnt_score})
+
+            targets_scored.sort(key=lambda x: x['score'])
+
+            # 3. VM별 목적지 배정 (Round-Robin 부하 가중치 적용)
+            migration_plan = []
+            for vm in vms_to_move:
+                if not targets_scored: break
+                best_target = targets_scored[0]
+                migration_plan.append({
+                    'vmid': vm['vmid'],
+                    'name': vm['name'],
+                    'source_node': src_node,
+                    'target_node': best_target['node'],
+                    'type': vm['type']
+                })
+                # 배정 후 해당 노드 점수 높여서 다음 VM은 다른 곳으로 유도
+                best_target['score'] += 0.3
+                targets_scored.sort(key=lambda x: x['score'])
+
+            print(json.dumps({'plan': migration_plan, 'vm_count': len(vms_to_move)}))
+        except Exception as e:
+            print(json.dumps({'error': str(e), 'plan': []}))
+        "
+      register: evacuate_analysis_raw
+      changed_when: false
+
+    - name: "[변수 설정] 계획 로드"
+      set_fact:
+        migration_plan: "{{ (evacuate_analysis_raw.stdout | from_json).plan | default([]) }}"
+        total_vms: "{{ (evacuate_analysis_raw.stdout | from_json).vm_count | default(0) }}"
+
+    - name: "[알림] 노드 대피 마이그레이션 계획"
+      debug:
+        msg: |
+          ============================================================
+          ⚠️  [유지보수 모드] 노드 비우기 시작
+          - 대상 노드: {{ source_node_input }}
+          - 이동할 VM 수: {{ total_vms }}대
+          ------------------------------------------------------------
+          {% for item in migration_plan %}
+          - {{ item.vmid }} ({{ item.name }}) ➡️ [{{ item.target_node }}]
+          {% endfor %}
+          ============================================================
+
+    - name: "[단계 1] 마이그레이션 명령 전송"
+      uri:
+        url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/{{ item.type }}/{{ item.vmid }}/migrate"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        body: { target: "{{ item.target_node }}", online: 1 }
+        body_format: form-urlencoded
+        validate_certs: false
+      loop: "{{ migration_plan }}"
+      when: migration_plan | length > 0
+      register: api_responses
+
+    - name: "[단계 2] 실시간 위치 추적 및 최종 검증"
+      environment:
+        ENV_MIGRATION_PLAN: "{{ migration_plan | to_json }}"
+      shell: |
+        {{ ansible_python_interpreter | default('python3') }} -c "
+        import os, json, urllib3, time
+        from proxmoxer import ProxmoxAPI
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        plan = json.loads(os.environ.get('ENV_MIGRATION_PLAN', '[]'))
+        url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
+        user = os.environ.get('PROXMOX_USER', '')
+        token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
+        token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
+        proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
+
+        results = []
+        pending_vms = {p['vmid']: p for p in plan}
+        
+        # 최대 15분 추적 (90회 * 10초)
+        for attempt in range(90):
+            res = proxmox.cluster.resources.get(type='vm')
+            current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
+            
+            finished = []
+            for vmid, p in pending_vms.items():
+                if current.get(vmid) == p['target_node']:
+                    results.append(f'- VM {vmid} ({p[\"name\"]}): ✅ 완료 (목적지: {p[\"target_node\"]})')
+                    finished.append(vmid)
+            
+            for vmid in finished: del pending_vms[vmid]
+            if not pending_vms: break
+            time.sleep(10)
+
+        for vmid, p in pending_vms.items():
+            results.append(f'- VM {vmid} ({p[\"name\"]}): ❌ 실패 (현재: {current.get(vmid, \"N/A\")})')
+
+        print('\n'.join(results))
+        "
+      register: final_report
+      when: migration_plan | length > 0
+      changed_when: false
+
+    - name: "[완료] 노드 비우기 결과 보고"
+      debug:
+        msg: |
+          ============================================================
+          🏁 노드 비우기 작업 종료
+          ============================================================
+          {{ final_report.stdout | default('이동할 VM이 없었습니다.') }}
+          ============================================================
