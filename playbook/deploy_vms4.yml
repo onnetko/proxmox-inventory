@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (타입 오류 완벽 해결본)
+- name: Proxmox VM 일괄 생성 (최종 안정화 버전)
   hosts: localhost
   gather_facts: false
 
@@ -9,6 +9,11 @@
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
 
   tasks:
+    - name: "[준비] 필수 라이브러리(proxmoxer) 설치"
+      pip:
+        name: [proxmoxer, requests]
+        state: present
+
     - name: "[단계 1] VM 복제 생성 (하드웨어 승계 보장)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
@@ -17,15 +22,13 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 템플릿 노드 지정
-        node: "xxhci00"
+        node: "xxhci00"   # 원본 템플릿 위치
         vmid: "{{ template_id }}"
         target: "xxhci01"
         name: "KFE-VM-{{ item }}"
         full: true
         state: present
-      # [핵심 수정] range 함수 대신 안정적인 with_sequence 사용
-      # survey_vm_count에 입력된 숫자만큼 1부터 순차적으로 실행합니다.
+      # 숫자를 안전하게 처리하는 with_sequence 사용 [cite: 2026-02-28]
       with_sequence: "start=1 end={{ survey_vm_count | default(1) }}"
 
     - name: "[단계 2] 생성된 VM 전원 켜기"
