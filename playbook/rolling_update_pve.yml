@@ -33,7 +33,7 @@
     - name: "[{{ inventory_hostname }}] 클러스터 상태 정상 확인 (pvecm status)"
       command: pvecm status
       register: pvecm_output
-      until: "'Quorate: Yes' in pvecm_output.stdout"
+      until: pvecm_output.stdout is search('Quorate:\s+Yes')
       retries: 10
       delay: 15
       changed_when: false
