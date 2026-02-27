@@ -1,10 +1,9 @@
 ---
-- name: Proxmox VM 일괄 복제 (비동기 병렬 처리 및 지능형 네이밍)
+- name: Proxmox VM 일괄 복제 (완벽 부하 분산 및 지능형 네이밍)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 설문에서 입력받은 전체 문자열 (예: "101 (VDIP-01win11)")을 그대로 받습니다.
     raw_template: "{{ survey_template_name | default('106 (Rocky10.0-Default)') }}"
     vm_count: "{{ (survey_vm_count | default(1)) | int }}"
 
@@ -14,15 +13,15 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[분석] 원본 위치 탐색, ID 추출 및 대상 노드 선정"
+    - name: "[분석] 통합 부하(CPU+RAM) 기반 최적 분산 배치 계획 수립"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
         import os, json, urllib3, re
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        # 1. 설문 입력값에서 정규표현식으로 맨 앞의 숫자(VM ID)만 확실하게 뽑아냅니다.
         raw_input = '{{ raw_template }}'
+        vm_count = {{ vm_count }}
         match = re.search(r'^(\d+)', raw_input)
         extracted_vmid = match.group(1) if match else raw_input.strip()
 
@@ -38,7 +37,7 @@
 
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 2. 추출한 VM ID를 기반으로 클러스터를 뒤져 원본의 정확한 이름과 노드를 찾습니다.
+            # 1. 원본 VM 정보 찾기
             for vm in proxmox.cluster.resources.get(type='vm'):
                 if str(vm.get('vmid')) == extracted_vmid or vm.get('name') == extracted_vmid:
                     source_node = vm.get('node')
@@ -46,20 +45,33 @@
                     source_vmid = str(vm.get('vmid'))
                     break
 
-            # 3. 제일 한가한 노드 찾기
+            # 2. 통합 부하 스코어(Load Score) 계산
             nodes = proxmox.nodes.get()
             online_nodes = [n for n in nodes if n.get('status') == 'online']
             
-            if online_nodes:
-                best_node = min(online_nodes, key=lambda n: n.get('cpu', 1.0))
-                target_node = best_node.get('node')
-            else:
-                target_node = source_node
+            for n in online_nodes:
+                # 메모리 사용률(0~1) + CPU 사용률(0~1) 합산 (낮을수록 한가함)
+                mem_pct = n.get('mem', 0) / n.get('maxmem', 1) if n.get('maxmem', 0) > 0 else 1.0
+                cpu_pct = n.get('cpu', 1.0)
+                n['load_score'] = mem_pct + cpu_pct
 
-            # 4. 분석된 모든 데이터를 JSON으로 앤서블에 넘깁니다.
+            # 3. 라운드 로빈(Round-Robin) 방식으로 각 VM이 들어갈 타겟 노드 리스트 생성
+            target_nodes_plan = []
+            if online_nodes:
+                # 부하가 적은 순서대로 노드 정렬
+                online_nodes.sort(key=lambda n: n['load_score'])
+                
+                # 생성할 VM 개수만큼 골고루 노드 배정
+                for i in range(vm_count):
+                    chosen_node = online_nodes[i % len(online_nodes)].get('node')
+                    target_nodes_plan.append(chosen_node)
+            else:
+                target_nodes_plan = [source_node] * vm_count
+
+            # 4. 분석 결과 출력
             print(json.dumps({
                 'source_node': source_node, 
-                'target_node': target_node, 
+                'target_nodes_plan': target_nodes_plan,  # 단일 노드가 아닌 리스트를 넘깁니다.
                 'actual_template_name': actual_name,
                 'source_vmid': source_vmid
             }))
@@ -68,7 +80,7 @@
             print(json.dumps({
                 'error': str(e), 
                 'source_node': 'xxhci00', 
-                'target_node': 'xxhci01', 
+                'target_nodes_plan': ['xxhci01'] * vm_count, 
                 'actual_template_name': actual_name, 
                 'source_vmid': extracted_vmid
             }))
@@ -76,18 +88,19 @@
       register: cluster_info_raw
       changed_when: false
 
-    - name: "[변수 설정] 분석된 지능형 노드 및 ID 정보 적용"
+    - name: "[변수 설정] 분석된 지능형 배치 리스트 적용"
       set_fact:
         dynamic_source_node: "{{ (cluster_info_raw.stdout | from_json).source_node }}"
-        dynamic_target_node: "{{ (cluster_info_raw.stdout | from_json).target_node }}"
+        # 이제 단일 변수가 아니라 배열(List)로 받습니다. [xxhci01, xxhci02, xxhci03...]
+        dynamic_target_nodes: "{{ (cluster_info_raw.stdout | from_json).target_nodes_plan }}"
         dynamic_template_name: "{{ (cluster_info_raw.stdout | from_json).actual_template_name }}"
         dynamic_source_vmid: "{{ (cluster_info_raw.stdout | from_json).source_vmid }}" 
 
-    - name: "[알림] 분석된 클러스터 배치 계획 출력"
+    - name: "[알림] 통합 부하 기반 분산 배치 계획"
       debug:
-        msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_source_vmid }} ({{ dynamic_template_name }})' ➡️ 🎯 대상(최적 노드): [{{ dynamic_target_node }}]"
+        msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_source_vmid }}' ➡️ 🎯 배치 계획: {{ dynamic_target_nodes }}"
 
-    - name: "[단계 1] 복제 명령 일괄 전송 (네이밍 규칙 적용 완료)"
+    - name: "[단계 1] 분산 복제 명령 일괄 전송 (네이밍 규칙 + 라운드 로빈 배치)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -97,11 +110,11 @@
         
         node: "{{ dynamic_source_node }}"
         clone: "{{ dynamic_template_name }}"
-        target: "{{ dynamic_target_node }}"
         
-        # [핵심 확인 포인트] 이 부분이 원하시는 네이밍 규칙을 만드는 곳입니다!
+        # [핵심] 1번 VM은 리스트의 첫 번째 노드로, 2번 VM은 두 번째 노드로 각각 매칭됩니다.
+        target: "{{ dynamic_target_nodes[(item | int) - 1] }}"
+        
         name: "{{ dynamic_source_vmid }}-KFE-VM-{{ item }}"
-        
         full: true
         timeout: 3600
         state: present
