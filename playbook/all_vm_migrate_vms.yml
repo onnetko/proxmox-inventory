@@ -1,5 +1,5 @@
 ---
-- name: Proxmox 가상호스트 긴급 유지보수 (Ansible 네이티브 무결점 추적형)
+- name: Proxmox 가상호스트 긴급 유지보수 (위치 기반 완벽 추적)
   hosts: localhost
   gather_facts: false
 
@@ -91,59 +91,56 @@
         - item.json.data is none or item.json.data == ""
         - not item.get('skipped', false)
 
-    - name: "[단계 2] 개별 리소스 이동 완료 대기 (Ansible 네이티브 UPID 모니터링)"
-      # [핵심] Proxmox가 반환한 작업 ID(UPID)의 상태가 'stopped'가 될 때까지 10초마다 상태를 새로고침합니다.
-      uri:
-        url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.item.source_node }}/tasks/{{ item.json.data | urlencode }}/status"
-        method: GET
-        headers:
-          Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        validate_certs: false
-        return_content: yes
-      loop: "{{ api_responses.results | default([]) }}"
-      when: 
-        - item.json is defined
-        - item.json.data is not none
-        - item.json.data != ""
-        - not item.get('skipped', false)
-      register: task_monitor
-      until: task_monitor.json is defined and task_monitor.json.data is defined and task_monitor.json.data.status == 'stopped'
-      retries: 180  # 180회 * 10초 = 최대 30분 대기
-      delay: 10
-
-    - name: "[단계 3] 100% 안착 여부 최종 크로스 체크"
-      # 마이그레이션이 끝난 후 클러스터 전체 리소스를 스캔하여 1초 만에 최종 결과를 확인합니다.
+    - name: "[단계 2] 실시간 위치 추적 (100% 도착 시까지 10초 단위 검증)"
+      # [핵심 변경] 파이썬 스크립트가 1회 검증을 수행하고, 성공하면 0, 실패(이동 중)면 1을 반환합니다. 
+      # 앤서블은 반환값이 0이 될 때까지 이 태스크를 10초마다 재실행합니다.
       environment:
         ENV_PLAN: "{{ (evacuate_analysis_raw.stdout | from_json).plan | to_json }}"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
-        import os, json, urllib3
+        import os, json, sys, urllib3
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         plan = json.loads(os.environ.get('ENV_PLAN', '[]'))
+        if not plan: sys.exit(0)
+
         url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
         user = os.environ.get('PROXMOX_USER', '')
         token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
         token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-        results = []
         res = proxmox.cluster.resources.get(type='vm')
         current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
         
+        pending = []
+        results = []
         for p in plan:
-            vmid = p['vmid']
+            vmid = str(p['vmid'])
             target = p['target_node']
             actual = current.get(vmid, 'N/A')
+            
             if actual == target:
-                results.append(f'- {vmid} ({p[\"name\"]}): ✅ 완료 (도착지: {actual})')
+                results.append(f'- {vmid} ({p[\"name\"]}) : ✅ 완료 (도착지: {actual})')
             else:
-                results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 (목표: {target}, 현재: {actual})')
+                pending.append(f'{vmid}')
+                results.append(f'- {vmid} ({p[\"name\"]}) : ⏳ 이동중 (현재: {actual} ➡️ 목표: {target})')
         
         print('\n'.join(results))
+        
+        # 아직 이동 중인 대상이 있다면 에러 코드(1)를 반환하여 앤서블이 재시도하도록 강제함
+        if pending:
+            print(f'\n아직 이동 중인 리소스: {len(pending)}대')
+            sys.exit(1)
+        else:
+            print('\n🎉 모든 리소스 이동 완료!')
+            sys.exit(0)
         "
-      register: final_report
+      register: tracking_result
+      until: tracking_result.rc == 0
+      retries: 180  # 180번 시도 (최대 30분)
+      delay: 10
       when: (evacuate_analysis_raw.stdout | from_json).plan | length > 0
       changed_when: false
 
@@ -153,5 +150,5 @@
           ============================================================
           🏁 가상호스트 대피(Evacuate) 최종 리포트
           ============================================================
-          {{ final_report.stdout | default('이동할 대상이 없었습니다.') }}
+          {{ tracking_result.stdout | default('이동할 대상이 없었습니다.') }}
           ============================================================
