@@ -1,5 +1,5 @@
 plugin: community.proxmox.proxmox
-validate_certs: false
+validate_certs: true
 want_proxmox_nodes_ansible_host: true
 group_by:
   - status
