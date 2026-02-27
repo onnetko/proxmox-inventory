@@ -1,0 +1,69 @@
+---
+- name: Proxmox VM 일괄 생성 (템플릿 사양 유지 및 네트워크 반영)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # 설문 변수 데이터 정제
+    raw_vm_count: "{{ survey_vm_count | default('1') }}"
+    prefix: "{{ survey_vm_name_prefix | default('KFE-VM') }}"
+    target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
+    # 설문에서 선택한 VNet 정보 (예: VLAN222)
+    selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
+    template_id: 106 
+
+  tasks:
+    - name: "[준비] 필수 파이썬 라이브러리 설치"
+      pip:
+        name: [proxmoxer, requests]
+        state: present
+
+    - name: "[단계 1] VM 복제 생성 (Full Clone)"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "xxhci00"   
+        vmid: "{{ template_id }}"
+        target: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
+        full: true 
+        timeout: 1800 
+        
+        # [수정] CPU/RAM 등 사양 파라미터를 제거하여 템플릿 값을 그대로 계승합니다.
+        # [반영] 설문 조사에서 선택한 네트워크 브리지 설정만 적용합니다.
+        net:
+          net0: "virtio,bridge={{ selected_vnet }}"
+          
+        state: present
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    - name: "[대기] 복제 완료 및 VM 등록 확인"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
+        state: present
+      register: vm_check
+      until: vm_check is success
+      retries: 30
+      delay: 15
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    - name: "[단계 2] 신규 VM 전원 켜기"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
+        state: started
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
