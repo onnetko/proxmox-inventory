@@ -107,7 +107,7 @@
       poll: 0
       register: migrate_jobs
 
-    - name: "[단계 2] 완료 대기"
+- name: "[단계 2] 완료 대기"
       async_status:
         jid: "{{ item.ansible_job_id }}"
       register: job_result
@@ -118,32 +118,44 @@
       when: item.ansible_job_id is defined
 
     - name: "[단계 3] 최종 위치 및 상태 검증 리포트"
+      # [교정] 데이터를 환경 변수로 넘겨 특수 문자 충돌을 원천 차단합니다.
+      environment:
+        ENV_MIGRATION_PLAN: "{{ migration_plan | to_json }}"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
-        import os, json, urllib3
+        import os, json, urllib3, time
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        plan = json.loads('{{ migration_plan | to_json }}')
+        # 1. 환경 변수에서 안전하게 계획 데이터 로드
+        plan_str = os.environ.get('ENV_MIGRATION_PLAN', '[]')
+        plan = json.loads(plan_str)
         results = []
 
         url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
         user = os.environ.get('PROXMOX_USER', '')
         token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
         token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
+        
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
+
+        # 2. Proxmox DB가 업데이트될 시간을 아주 잠깐(2초) 기다립니다.
+        time.sleep(2)
 
         resources = proxmox.cluster.resources.get(type='vm')
         current_vms = {str(r.get('vmid')): r.get('node') for r in resources if r.get('type') in ['qemu', 'lxc']}
 
         for p in plan:
-            vmid = p['vmid']
+            vmid = str(p['vmid'])
             target = p['target_node']
             actual = current_vms.get(vmid, 'N/A')
             status = '✅ 성공' if target == actual else '❌ 실패'
-            results.append(f'- VM {vmid} ({p[\"name\"]}): {status} (현재 위치: {actual})')
+            results.append(f'- VM {vmid} ({p[\"name\"]}): {status} (목표: {target} / 현재: {actual})')
         
-        print('\n'.join(results))
+        if results:
+            print('\n'.join(results))
+        else:
+            print('분석된 결과가 없습니다.')
         "
       register: final_report
       when: migration_plan | length > 0
