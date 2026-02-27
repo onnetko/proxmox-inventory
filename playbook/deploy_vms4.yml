@@ -1,20 +1,18 @@
 ---
-- name: Proxmox VM 일괄 생성 (단순 복제 모드)
+- name: Proxmox VM 일괄 생성 (가장 단순한 복제 모드)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 설문 변수: 템플릿 ID와 생성 대수만 사용
+    # 설문 변수: 템플릿과 개수만 정확히 처리
     raw_template: "{{ survey_template_name | default('106') }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
-    vm_count: "{{ survey_vm_count | default(1) | int }}"
     
-    # 기본값 설정
-    target_node: "xxhci01"
-    prefix: "KFE-VM"
+    # [교정] 숫자로 확실하게 변환하여 루프 오류 방지
+    vm_count: "{{ (survey_vm_count | default(1)) | int }}"
 
   tasks:
-    - name: "[단계 1] VM 복제 생성"
+    - name: "[단계 1] VM 복제 생성 (사양 100% 승계)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -22,13 +20,14 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 최소한의 필수 파라미터만 사용
+        # 템플릿이 있는 노드에서 복제 실행
         node: "xxhci00"
         vmid: "{{ template_id }}"
-        target: "{{ target_node }}"
-        name: "{{ prefix }}-{{ item }}"
+        target: "xxhci01"
+        name: "KFE-VM-{{ item }}"
         full: true
         state: present
+      # vm_count를 확실한 숫자로 계산
       loop: "{{ range(1, vm_count + 1) | list }}"
 
     - name: "[단계 2] 복제된 VM 전원 켜기"
@@ -38,7 +37,7 @@
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
-        node: "{{ target_node }}"
-        name: "{{ prefix }}-{{ item }}"
+        node: "xxhci01"
+        name: "KFE-VM-{{ item }}"
         state: started
       loop: "{{ range(1, vm_count + 1) | list }}"
