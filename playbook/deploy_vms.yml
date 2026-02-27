@@ -1,9 +1,25 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성 (파라미터 교정본)
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (문법 교정본)
   hosts: localhost
   gather_facts: false
 
-tasks:
+  vars:
+    # 1. 매핑 테이블 및 변수 정의 (모두 위로 모음)
+    spec_map:
+      "Small (1 core / 2GB)": { "cpu": 1, "ram": 2048 }
+      "Medium (2 cores / 4GB)": { "cpu": 2, "ram": 4096 }
+      "Large (4 cores / 8GB)": { "cpu": 4, "ram": 8192 }
+
+    raw_vm_count: "{{ survey_vm_count | default('1') }}"
+    vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
+    # 리스트 처리 및 기본값 설정
+    target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
+    template_name: "{{ survey_template_name }}"
+    selected_spec: "{{ survey_vm_spec }}"
+    selected_vnet: "{{ survey_vm_vnet }}"
+
+  tasks:
+    # 2. 작업 시작 (순차적으로 진행)
     - name: "[준비] 필수 파이썬 라이브러리(proxmoxer) 즉시 설치"
       pip:
         name: 
@@ -14,29 +30,7 @@ tasks:
     - name: "[확인] 입력된 변수 값 디버깅"
       debug:
         msg: 
-          - "선택된 사양: {{ selected_spec | default('Small (1 core / 2GB)') }}"
-          - "최종 대상 노드: {{ target_node | default('xxhci01') }}"
-          - "VNet: {{ selected_vnet | default('') }}"
-  
-  vars:
-    spec_map:
-      "Small (1 core / 2GB)": { "cpu": 1, "ram": 2048 }
-      "Medium (2 cores / 4GB)": { "cpu": 2, "ram": 4096 }
-      "Large (4 cores / 8GB)": { "cpu": 4, "ram": 8192 }
-
-    raw_vm_count: "{{ survey_vm_count | default('1') }}"
-    vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
-    # 리스트로 들어오는 경우 첫 번째 항목을 선택하도록 수정
-    target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    template_name: "{{ survey_template_name }}"
-    selected_spec: "{{ survey_vm_spec }}"
-    selected_vnet: "{{ survey_vm_vnet }}"
-
-  tasks:
-    - name: "[확인] 입력된 변수 값 디버깅"
-      debug:
-        msg: 
-          - "선택된 사양: {{ selected_spec }}"
+          - "선택된 사양: {{ selected_spec | default('N/A') }}"
           - "최종 대상 노드: {{ target_node }}"
           - "VNet: {{ selected_vnet }}"
 
@@ -57,7 +51,6 @@ tasks:
         cores: "{{ spec_map[selected_spec].cpu | default(2) }}"
         memory: "{{ spec_map[selected_spec].ram | default(4096) }}"
         
-        # [수정] netif 대신 net 파라미터를 사용하며, 딕셔너리 형태로 전달합니다.
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
         
