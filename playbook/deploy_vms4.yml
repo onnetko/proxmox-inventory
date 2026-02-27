@@ -1,13 +1,13 @@
 ---
-- name: Proxmox VM 일괄 생성 (하드웨어 완벽 승계 및 부팅 루프 해결)
+- name: Proxmox VM 일괄 생성 (EFI/TPM/장치 완벽 복구본)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 설문 변수 처리
     raw_template: "{{ survey_template_name | default('106') }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
-    vm_count_int: "{{ (survey_vm_count | default(1)) | int }}"
+    vm_count: "{{ (survey_vm_count | default(1)) | int }}"
+    target_node: "xxhci01"
 
   tasks:
     - name: "[준비] 필수 라이브러리 설치"
@@ -15,7 +15,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] 순수 복제 실행 (사양 간섭 배제)"
+    - name: "[단계 1] 순수 복제 실행"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -24,28 +24,57 @@
         validate_certs: false
         node: "xxhci00"
         vmid: "{{ template_id }}"
-        target: "xxhci01"
+        target: "{{ target_node }}"
         name: "KFE-VM-{{ item }}"
         full: true
         state: present
-      with_sequence: "start=1 end={{ vm_count_int }}"
+      with_sequence: "start=1 end={{ vm_count }}"
 
-    - name: "[단계 2] 하드웨어 사양 강제 동기화 (부팅 루프 방지 핵심)"
+    - name: "[대기] 복제 완료 확인"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
-        node: "xxhci01"
+        node: "{{ target_node }}"
         name: "KFE-VM-{{ item }}"
-        # 106번 템플릿의 실제 사양을 수동으로 다시 기입합니다.
+      register: vm_check
+      until: vm_check is success
+      retries: 30
+      delay: 20
+      with_sequence: "start=1 end={{ vm_count }}"
+
+    - name: "[단계 2] 누락된 하드웨어 장치 강제 재구성"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "KFE-VM-{{ item }}"
+        
+        # 1. 기본 사양 강제 주입
         cores: 8
         memory: 8192
-        # [핵심] 컨트롤러를 VirtIO SCSI로 고정하여 부팅 문제를 해결합니다.
         scsihw: virtio-scsi-pci
+        
+        # 2. EFI 및 TPM 상태 복구 (부팅 필수 요소) [cite: 2026-02-28]
+        efidisk0: 
+          storage: "CephPool-VM-DMZ" # 이미지에서 확인된 스토리지
+          format: "raw"
+          efitype: "4m"
+        tpmstate0:
+          storage: "CephPool-VM-DMZ"
+          version: "v2.0"
+
+        # 3. CD/DVD 및 장치 연결 정보 복구
+        ide2: "CephFS-iso:iso/Rocky-10.0-x86_64-dvd1.iso,media=cdrom"
+        net0: "virtio,bridge=VLAN222" # 템플릿과 동일한 브리지
+        
         state: present
-      with_sequence: "start=1 end={{ vm_count_int }}"
+      with_sequence: "start=1 end={{ vm_count }}"
 
     - name: "[단계 3] 교정된 VM 전원 켜기"
       community.proxmox.proxmox_kvm:
@@ -54,7 +83,7 @@
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
-        node: "xxhci01"
+        node: "{{ target_node }}"
         name: "KFE-VM-{{ item }}"
         state: started
-      with_sequence: "start=1 end={{ vm_count_int }}"
+      with_sequence: "start=1 end={{ vm_count }}"
