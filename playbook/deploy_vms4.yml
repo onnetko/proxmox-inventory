@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (파라미터 그룹화 완벽 교정)
+- name: Proxmox VM 일괄 생성 (ISO 에러 우회 및 장치 복구)
   hosts: localhost
   gather_facts: false
 
@@ -62,7 +62,7 @@
         memory: 8192
         scsihw: virtio-scsi-pci
         
-        # 2. EFI 및 TPM 복구 (모듈 최상위 지원 파라미터)
+        # 2. EFI 및 TPM 복구
         efidisk0: 
           storage: "CephPool-VM-DMZ"
           format: "raw"
@@ -71,9 +71,10 @@
           storage: "CephPool-VM-DMZ"
           version: "2.0"
 
-        # 3. [교정] CD/DVD 및 네트워크 장치 그룹화
+        # 3. CD/DVD 및 네트워크 장치 복구
         ide:
-          ide2: "CephFS-iso:iso/Rocky-10.0-x86_64-dvd1.iso,media=cdrom"
+          # [핵심] ISO 파일 연결 에러를 피하기 위해 '빈 CD-ROM(none)'으로 명시
+          ide2: "none,media=cdrom"
         net:
           net0: "virtio,bridge=VLAN222"
         
