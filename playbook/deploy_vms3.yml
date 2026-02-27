@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (하드웨어 사양 계승 및 네트워크 최적화)
+- name: Proxmox VM 일괄 생성 (사양 승계 및 설문 반영)
   hosts: localhost
   gather_facts: false
 
@@ -13,7 +13,7 @@
     raw_template: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) | trim }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
     
-    # 설문에서 선택한 VNet 정보 (예: VLAN222)
+    # 설문에서 선택한 VNet 정보 반영
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
 
   tasks:
@@ -22,7 +22,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] VM 복제 생성 (Full Clone & 사양 유지)"
+    - name: "[단계 1] VM 복제 생성 (템플릿 사양 기반)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -30,18 +30,18 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 원본 노드 지정 (xxhci00)
+        # 원본 노드 지정 (템플릿 위치)
         node: "xxhci00"   
         vmid: "{{ template_id }}"
         target: "{{ target_node }}"
         name: "{{ prefix }}-{{ item }}"
         
-        # [핵심] Full Clone 시 템플릿의 하드웨어(CPU/RAM/DISK/Controller)를 그대로 복사합니다.
+        # [핵심] Full Clone을 통해 템플릿의 모든 사양을 기본적으로 가져옵니다.
         full: true 
         timeout: 1800 
         
-        # [반영] 네트워크만 설문 선택값으로 변경합니다.
-        # 주의: 템플릿의 다른 설정(VirtIO SCSI 등)을 건드리지 않도록 사양 파라미터는 생략합니다.
+        # [수정] 설문에서 선택한 네트워크만 명시적으로 업데이트합니다.
+        # CPU, 메모리 등의 파라미터를 삭제하여 템플릿 사양이 덮어씌워지지 않도록 보호합니다.
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
           
@@ -53,7 +53,7 @@
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        api_host: "{{ lookup('env', 'PROXMO tax_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         node: "{{ target_node }}"
         name: "{{ prefix }}-{{ item }}"
