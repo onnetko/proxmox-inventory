@@ -1,10 +1,9 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성 (전체 이름 매칭 방식)
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (파라미터 최종 교정)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 사양 매핑 테이블
     spec_map:
       "Small (1 core / 2GB)": { "cpu": 1, "ram": 2048 }
       "Medium (2 cores / 4GB)": { "cpu": 2, "ram": 4096 }
@@ -13,12 +12,9 @@
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
     vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
     
-    # [교정] 리스트 형태로 들어오는 설문 응답을 순수 문자열로 변환
+    # 리스트 처리 및 데이터 정제
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    
-    # [수정] 템플릿 전체 이름을 그대로 사용 (정규표현식 제거)
     template_full_name: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) }}"
-    
     selected_spec: "{{ (survey_vm_spec is iterable and survey_vm_spec is not string) | ternary(survey_vm_spec[0], survey_vm_spec) }}"
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
 
@@ -27,14 +23,6 @@
       pip:
         name: [proxmoxer, requests]
         state: present
-
-    - name: "[확인] 입력 변수 최종 디버깅"
-      debug:
-        msg: 
-          - "원본 템플릿 이름: {{ template_full_name }}"
-          - "대상 노드: {{ target_node }}"
-          - "VNet 브리지: {{ selected_vnet }}"
-          - "선택 사양: {{ selected_spec }}"
 
     - name: "[생성] {{ raw_vm_count }}대의 VM 복제 및 자동 시작"
       community.proxmox.proxmox_kvm:
@@ -45,7 +33,7 @@
         validate_certs: false
         
         node: "{{ target_node }}"
-        clone: "{{ template_full_name }}" # 설문에서 선택한 전체 이름을 그대로 사용
+        clone: "{{ template_full_name | trim }}" # 혹시 모를 앞뒤 공백 제거
         name: "{{ vm_name_prefix }}-{{ item }}"
         full: true
         timeout: 600
@@ -55,6 +43,6 @@
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
         
-        state: present
-        start: yes
+        # [수정] start: yes 대신 state: started를 사용하여 생성 후 즉시 실행
+        state: started
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
