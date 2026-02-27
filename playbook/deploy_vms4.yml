@@ -1,13 +1,11 @@
 ---
-- name: Proxmox VM 복제 (전원 OFF, 지능형 노드 배치)
+- name: Proxmox VM 복제 (중복 방지, 전원 OFF, 지능형 배치)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 설문에서 입력받은 템플릿/VM 정보 (이름 또는 ID를 유연하게 추출)
     raw_template: "{{ survey_template_name | default('Rocky10.0-Default') }}"
     search_target: "{{ raw_template | regex_replace('^.*\\((.*)\\).*$', '\\1') | trim }}"
-    
     vm_count: "{{ (survey_vm_count | default(1)) | int }}"
 
   tasks:
@@ -35,14 +33,12 @@
             source_node = 'xxhci00'
             actual_name = search_target
             
-            # 1. 클러스터 전체에서 원본 VM/템플릿 찾기
             for vm in proxmox.cluster.resources.get(type='vm'):
                 if str(vm.get('vmid')) == search_target or vm.get('name') == search_target or str(vm.get('vmid')) in search_target:
                     source_node = vm.get('node')
                     actual_name = vm.get('name')
                     break
 
-            # 2. 모든 온라인 노드의 CPU 사용량을 분석하여 가장 한가한 노드 찾기
             nodes = proxmox.nodes.get()
             online_nodes = [n for n in nodes if n.get('status') == 'online']
             
@@ -59,7 +55,6 @@
             }))
             
         except Exception as e:
-            # 오류 발생 시 안전한 기본값 반환
             print(json.dumps({'error': str(e), 'source_node': 'xxhci00', 'target_node': 'xxhci01', 'actual_template_name': '{{ search_target }}'}))
         "
       register: cluster_info_raw
@@ -71,11 +66,11 @@
         dynamic_target_node: "{{ (cluster_info_raw.stdout | from_json).target_node }}"
         dynamic_template_name: "{{ (cluster_info_raw.stdout | from_json).actual_template_name }}"
 
-    - name: "[알림] 분석된 클러스터 배치 계획"
+    - name: "[알림] 분석된 클러스터 배치 계획 출력"
       debug:
         msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_template_name }}' ➡️ 🎯 대상(최적 노드): [{{ dynamic_target_node }}]"
 
-    - name: "[단계 1] 지능형 복제 실행 (전원 켜지 않음, 대용량 대기)"
+    - name: "[단계 1] 지능형 복제 실행 (중복 방지 및 전원 OFF)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -89,23 +84,8 @@
         
         name: "KFE-VM-{{ item }}"
         full: true
-        timeout: 3600
         
-        # [핵심] state: started를 제거하여 복제만 수행하고 전원은 켜지 않습니다.
+        # 3600초 동안 완벽하게 대기하므로 추가 확인 태스크가 필요 없습니다.
+        timeout: 3600
         state: present
-      loop: "{{ range(1, (vm_count | int) + 1) | list }}"
-
-    - name: "[대기] 복제 프로세스 100% 완료 확인"
-      community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
-        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
-        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
-        validate_certs: false
-        node: "{{ dynamic_target_node }}"
-        name: "KFE-VM-{{ item }}"
-      register: vm_check
-      until: vm_check is success
-      retries: 30
-      delay: 20
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
