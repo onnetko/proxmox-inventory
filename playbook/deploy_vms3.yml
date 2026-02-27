@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (템플릿 선택 기능 추가)
+- name: Proxmox VM 일괄 생성 (하드웨어 사양 계승 및 네트워크 최적화)
   hosts: localhost
   gather_facts: false
 
@@ -9,11 +9,11 @@
     prefix: "{{ survey_vm_name_prefix | default('KFE-VM') }}"
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
     
-    # [추가] 설문에서 선택한 템플릿 이름 (예: "106 (Rocky10.0-Default)")
+    # 템플릿 선택 및 ID 추출
     raw_template: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) | trim }}"
-    # 전체 이름에서 맨 앞의 숫자 ID만 추출하여 변수에 할당
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
     
+    # 설문에서 선택한 VNet 정보 (예: VLAN222)
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
 
   tasks:
@@ -22,29 +22,31 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[확인] 선택된 템플릿 정보 디버깅"
-      debug:
-        msg: "선택된 템플릿: {{ raw_template }} (ID: {{ template_id }})"
-
-    - name: "[단계 1] VM 복제 생성 (Full Clone)"
+    - name: "[단계 1] VM 복제 생성 (Full Clone & 사양 유지)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
+        
+        # 원본 노드 지정 (xxhci00)
         node: "xxhci00"   
-        vmid: "{{ template_id }}" # 추출된 ID 사용
+        vmid: "{{ template_id }}"
         target: "{{ target_node }}"
         name: "{{ prefix }}-{{ item }}"
+        
+        # [핵심] Full Clone 시 템플릿의 하드웨어(CPU/RAM/DISK/Controller)를 그대로 복사합니다.
         full: true 
         timeout: 1800 
+        
+        # [반영] 네트워크만 설문 선택값으로 변경합니다.
+        # 주의: 템플릿의 다른 설정(VirtIO SCSI 등)을 건드리지 않도록 사양 파라미터는 생략합니다.
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
+          
         state: present
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
-
-    # ... 이후 [대기] 및 [단계 2] 부팅 태스크는 이전과 동일 ...
 
     - name: "[대기] 복제 완료 및 VM 등록 확인"
       community.proxmox.proxmox_kvm:
