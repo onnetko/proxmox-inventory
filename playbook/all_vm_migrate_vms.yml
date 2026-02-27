@@ -1,5 +1,5 @@
 ---
-- name: Proxmox 가상호스트 긴급 유지보수 (LXC/VM 통합 무결점 마이그레이션)
+- name: Proxmox 가상호스트 긴급 유지보수 (Ansible 네이티브 무결점 추적형)
   hosts: localhost
   gather_facts: false
 
@@ -13,7 +13,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[분석] 출발지 가상호스트의 모든 리소스 스캔 및 부하 분산"
+    - name: "[분석] 출발지 가상호스트 리소스 스캔 및 부하 분산"
       environment:
         ENV_SOURCE_NODE: "{{ source_node_input }}"
         ENV_TARGET_NODES: "{{ target_nodes_input | string }}"
@@ -25,7 +25,6 @@
 
         src_node = os.environ.get('ENV_SOURCE_NODE', '').strip()
         raw_targets = os.environ.get('ENV_TARGET_NODES', '')
-        
         cleaned_targets = raw_targets.replace('[', '').replace(']', '').replace('\'', '').replace('\"', '')
         target_list = [n.strip() for n in cleaned_targets.split(',') if n.strip() and n.strip() != src_node]
 
@@ -68,7 +67,7 @@
       register: evacuate_analysis_raw
       changed_when: false
 
-    - name: "[단계 1] 마이그레이션 명령 전송 (LXC/VM 타입별 파라미터 완벽 분기)"
+    - name: "[단계 1] 마이그레이션 명령 전송 (LXC/VM 타입별 파라미터 분기)"
       uri:
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/{{ item.type }}/{{ item.vmid }}/migrate"
         method: POST
@@ -83,21 +82,42 @@
       when: (evacuate_analysis_raw.stdout | from_json).plan | length > 0
       register: api_responses
 
-    - name: "[오류 진단] UPID 생성 실패 리소스 확인"
+    - name: "[오류 진단] 작업 생성 실패 여부 확인"
       fail:
-        msg: "리소스 {{ item.item.vmid }} ({{ item.item.name }}) 명령 거부: {{ item.content }}"
+        msg: "명령 거부됨: {{ item.content }}"
       loop: "{{ api_responses.results | default([]) }}"
       when: 
         - item.json is defined
         - item.json.data is none or item.json.data == ""
         - not item.get('skipped', false)
 
-    - name: "[단계 2] 실시간 위치 추적 및 최종 안착 검증 (API 장애 방어 적용)"
+    - name: "[단계 2] 개별 리소스 이동 완료 대기 (Ansible 네이티브 UPID 모니터링)"
+      # [핵심] Proxmox가 반환한 작업 ID(UPID)의 상태가 'stopped'가 될 때까지 10초마다 상태를 새로고침합니다.
+      uri:
+        url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.item.source_node }}/tasks/{{ item.json.data | urlencode }}/status"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        validate_certs: false
+        return_content: yes
+      loop: "{{ api_responses.results | default([]) }}"
+      when: 
+        - item.json is defined
+        - item.json.data is not none
+        - item.json.data != ""
+        - not item.get('skipped', false)
+      register: task_monitor
+      until: task_monitor.json is defined and task_monitor.json.data is defined and task_monitor.json.data.status == 'stopped'
+      retries: 180  # 180회 * 10초 = 최대 30분 대기
+      delay: 10
+
+    - name: "[단계 3] 100% 안착 여부 최종 크로스 체크"
+      # 마이그레이션이 끝난 후 클러스터 전체 리소스를 스캔하여 1초 만에 최종 결과를 확인합니다.
       environment:
         ENV_PLAN: "{{ (evacuate_analysis_raw.stdout | from_json).plan | to_json }}"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
-        import os, json, urllib3, time
+        import os, json, urllib3
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -108,39 +128,30 @@
         token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-        results, pending = [], {p['vmid']: p for p in plan}
-        current = {}
+        results = []
+        res = proxmox.cluster.resources.get(type='vm')
+        current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
         
-        # 최대 180회 (30분간) 안전하게 추적합니다.
-        for _ in range(180):
-            try:
-                # [핵심 보정] API 과부하 시 스크립트가 죽지 않도록 예외 처리
-                res = proxmox.cluster.resources.get(type='vm')
-                current = {str(r.get('vmid')): r.get('node') for r in res if r.get('type') in ['qemu', 'lxc']}
-                
-                done = [vmid for vmid, p in pending.items() if current.get(vmid) == p['target_node']]
-                for vmid in done:
-                    results.append(f'- {vmid} ({pending[vmid][\"name\"]}): ✅ 완료')
-                    del pending[vmid]
-                if not pending: break
-            except Exception:
-                # Proxmox API가 무응답이어도 에러를 내지 않고 조용히 넘어갑니다.
-                pass
-            time.sleep(10)
+        for p in plan:
+            vmid = p['vmid']
+            target = p['target_node']
+            actual = current.get(vmid, 'N/A')
+            if actual == target:
+                results.append(f'- {vmid} ({p[\"name\"]}): ✅ 완료 (도착지: {actual})')
+            else:
+                results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 (목표: {target}, 현재: {actual})')
         
-        for vmid, p in pending.items():
-            results.append(f'- {vmid} ({p[\"name\"]}): ❌ 실패 또는 지연 (현재: {current.get(vmid, \"N/A\")})')
         print('\n'.join(results))
         "
       register: final_report
       when: (evacuate_analysis_raw.stdout | from_json).plan | length > 0
       changed_when: false
 
-    - name: "[완료] 최종 결과 보고"
+    - name: "[완료] 가상호스트 대피 최종 결과 보고"
       debug:
         msg: |
           ============================================================
-          🏁 노드 비우기(Evacuate) 작업 결과
+          🏁 가상호스트 대피(Evacuate) 최종 리포트
           ============================================================
           {{ final_report.stdout | default('이동할 대상이 없었습니다.') }}
           ============================================================
