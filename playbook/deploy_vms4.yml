@@ -4,8 +4,8 @@
   gather_facts: false
 
   vars:
-    raw_template: "{{ survey_template_name | default('Rocky10.0-Default') }}"
-    search_target: "{{ raw_template | regex_replace('^.*\\((.*)\\).*$', '\\1') | trim }}"
+    # 설문에서 입력받은 전체 문자열 (예: "101 (VDIP-01win11)")을 그대로 받습니다.
+    raw_template: "{{ survey_template_name | default('106 (Rocky10.0-Default)') }}"
     vm_count: "{{ (survey_vm_count | default(1)) | int }}"
 
   tasks:
@@ -14,12 +14,21 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[분석] 원본 위치 탐색 및 최적의 대상(한가한) 노드 선정"
+    - name: "[분석] 원본 위치 탐색, ID 추출 및 대상 노드 선정"
       shell: |
         {{ ansible_python_interpreter | default('python3') }} -c "
-        import os, json, urllib3
+        import os, json, urllib3, re
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # 1. 설문 입력값에서 정규표현식으로 맨 앞의 숫자(VM ID)만 확실하게 뽑아냅니다.
+        raw_input = '{{ raw_template }}'
+        match = re.search(r'^(\d+)', raw_input)
+        extracted_vmid = match.group(1) if match else raw_input.strip()
+
+        source_node = 'xxhci00'
+        actual_name = raw_input
+        source_vmid = extracted_vmid
 
         try:
             url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
@@ -29,20 +38,15 @@
 
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            search_target = '{{ search_target }}'
-            source_node = 'xxhci00'
-            actual_name = search_target
-            # [추가] 원본 VM의 ID를 담을 변수를 초기화합니다.
-            source_vmid = '000' 
-            
+            # 2. 추출한 VM ID를 기반으로 클러스터를 뒤져 원본의 정확한 이름과 노드를 찾습니다.
             for vm in proxmox.cluster.resources.get(type='vm'):
-                if str(vm.get('vmid')) == search_target or vm.get('name') == search_target or str(vm.get('vmid')) in search_target:
+                if str(vm.get('vmid')) == extracted_vmid or vm.get('name') == extracted_vmid:
                     source_node = vm.get('node')
                     actual_name = vm.get('name')
-                    # [추가] 찾은 원본의 실제 VM ID를 추출합니다.
-                    source_vmid = str(vm.get('vmid')) 
+                    source_vmid = str(vm.get('vmid'))
                     break
 
+            # 3. 제일 한가한 노드 찾기
             nodes = proxmox.nodes.get()
             online_nodes = [n for n in nodes if n.get('status') == 'online']
             
@@ -52,16 +56,22 @@
             else:
                 target_node = source_node
 
+            # 4. 분석된 모든 데이터를 JSON으로 앤서블에 넘깁니다.
             print(json.dumps({
                 'source_node': source_node, 
                 'target_node': target_node, 
                 'actual_template_name': actual_name,
-                # [추가] JSON 결과에 원본 ID를 포함하여 앤서블로 넘깁니다.
-                'source_vmid': source_vmid 
+                'source_vmid': source_vmid
             }))
             
         except Exception as e:
-            print(json.dumps({'error': str(e), 'source_node': 'xxhci00', 'target_node': 'xxhci01', 'actual_template_name': '{{ search_target }}', 'source_vmid': '000'}))
+            print(json.dumps({
+                'error': str(e), 
+                'source_node': 'xxhci00', 
+                'target_node': 'xxhci01', 
+                'actual_template_name': actual_name, 
+                'source_vmid': extracted_vmid
+            }))
         "
       register: cluster_info_raw
       changed_when: false
@@ -71,14 +81,13 @@
         dynamic_source_node: "{{ (cluster_info_raw.stdout | from_json).source_node }}"
         dynamic_target_node: "{{ (cluster_info_raw.stdout | from_json).target_node }}"
         dynamic_template_name: "{{ (cluster_info_raw.stdout | from_json).actual_template_name }}"
-        # [추가] 앤서블 변수로 원본 ID를 등록합니다.
         dynamic_source_vmid: "{{ (cluster_info_raw.stdout | from_json).source_vmid }}" 
 
     - name: "[알림] 분석된 클러스터 배치 계획 출력"
       debug:
         msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_source_vmid }} ({{ dynamic_template_name }})' ➡️ 🎯 대상(최적 노드): [{{ dynamic_target_node }}]"
 
-    - name: "[단계 1] 복제 명령 일괄 전송 (네트워크 끊김 방지 및 네이밍 적용)"
+    - name: "[단계 1] 복제 명령 일괄 전송 (네이밍 규칙 적용 완료)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -90,14 +99,13 @@
         clone: "{{ dynamic_template_name }}"
         target: "{{ dynamic_target_node }}"
         
-        # [핵심 교정] 원본ID-KFE-VM-순번 형태로 이름을 동적 생성합니다 (예: 101-KFE-VM-1).
+        # [핵심 확인 포인트] 이 부분이 원하시는 네이밍 규칙을 만드는 곳입니다!
         name: "{{ dynamic_source_vmid }}-KFE-VM-{{ item }}"
         
         full: true
         timeout: 3600
         state: present
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
-      
       async: 3600
       poll: 0
       register: clone_jobs
