@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 복제 (중복 방지, 전원 OFF, 지능형 배치)
+- name: Proxmox VM 일괄 복제 (비동기 병렬 처리, 타임아웃 완벽 해결)
   hosts: localhost
   gather_facts: false
 
@@ -70,7 +70,7 @@
       debug:
         msg: "✅ 원본: [{{ dynamic_source_node }}] 노드의 '{{ dynamic_template_name }}' ➡️ 🎯 대상(최적 노드): [{{ dynamic_target_node }}]"
 
-    - name: "[단계 1] 지능형 복제 실행 (중복 방지 및 전원 OFF)"
+    - name: "[단계 1] 복제 명령 일괄 전송 (네트워크 끊김 방지)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -84,8 +84,21 @@
         
         name: "KFE-VM-{{ item }}"
         full: true
-        
-        # 3600초 동안 완벽하게 대기하므로 추가 확인 태스크가 필요 없습니다.
         timeout: 3600
         state: present
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
+      
+      # [핵심] 명령을 순차적으로 기다리지 않고 백그라운드로 동시에 던집니다.
+      async: 3600
+      poll: 0
+      register: clone_jobs
+
+    - name: "[대기] 전체 VM 복제 진행 상태 모니터링 (15초 주기 생존 신고)"
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      # 15초마다 한 번씩 최대 240번(1시간) 물어봅니다.
+      retries: 240
+      delay: 15
+      loop: "{{ clone_jobs.results }}"
