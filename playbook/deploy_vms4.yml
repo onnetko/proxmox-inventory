@@ -1,10 +1,9 @@
 ---
-- name: Proxmox VM 일괄 생성 (최종 안정화 버전)
+- name: Proxmox VM 일괄 생성 (부팅 오류 완벽 해결본)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 템플릿 이름에서 ID 추출
     raw_template: "{{ survey_template_name | default('106') }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
 
@@ -14,14 +13,14 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] VM 복제 생성 (하드웨어 승계 보장)"
+    - name: "[단계 1] VM 복제 생성 (Full Clone)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
-        node: "xxhci00"   # 원본 템플릿 위치
+        node: "xxhci00"
         vmid: "{{ template_id }}"
         target: "xxhci01"
         name: "KFE-VM-{{ item }}"
@@ -29,7 +28,7 @@
         state: present
       with_sequence: "start=1 end={{ survey_vm_count | default(1) }}"
 
-    - name: "[대기] 복제 완료 확인"
+    - name: "[대기] 복제 프로세스 완료 대기"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -44,9 +43,28 @@
       delay: 20
       with_sequence: "start=1 end={{ survey_vm_count | default(1) }}"
 
-    - name: "[단계 2] 생성된 VM 전원 켜기"
+    - name: "[단계 2] 하드웨어 사양 강제 교정 (부팅 루프 해결 핵심)"
       community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PROXMOX_USER') }}" # 오타 수정 완료
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "xxhci01"
+        name: "KFE-VM-{{ item }}"
+        
+        # 템플릿(106번)의 실제 사양을 강제로 기입하여 승계 실패 우회
+        cores: 8
+        memory: 8192
+        # [중요] 컨트롤러를 VirtIO SCSI로 강제 지정하여 마운트 오류 해결
+        scsihw: virtio-scsi-pci
+        
+        state: present
+      with_sequence: "start=1 end={{ survey_vm_count | default(1) }}"
+
+    - name: "[단계 3] 교정된 VM 전원 켜기"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
