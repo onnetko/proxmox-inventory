@@ -1,9 +1,10 @@
 ---
-- name: Proxmox VM 일괄 생성 (복제 완료 대기 포함)
+- name: Proxmox VM 일괄 생성 (최종 안정화 버전)
   hosts: localhost
   gather_facts: false
 
   vars:
+    # 템플릿 이름에서 ID 추출
     raw_template: "{{ survey_template_name | default('106') }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
 
@@ -13,14 +14,14 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] VM 복제 생성"
+    - name: "[단계 1] VM 복제 생성 (하드웨어 승계 보장)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
-        node: "xxhci00"
+        node: "xxhci00"   # 원본 템플릿 위치
         vmid: "{{ template_id }}"
         target: "xxhci01"
         name: "KFE-VM-{{ item }}"
@@ -28,7 +29,7 @@
         state: present
       with_sequence: "start=1 end={{ survey_vm_count | default(1) }}"
 
-    - name: "[대기] 복제 완료 시까지 대기 (최대 10분)"
+    - name: "[대기] 복제 완료 확인"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -38,7 +39,6 @@
         node: "xxhci01"
         name: "KFE-VM-{{ item }}"
       register: vm_check
-      # VM이 인식될 때까지 20초마다 총 30번 재시도합니다.
       until: vm_check is success
       retries: 30
       delay: 20
@@ -46,7 +46,7 @@
 
     - name: "[단계 2] 생성된 VM 전원 켜기"
       community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PRO [lookup('env', 'PROXMOX_USER') }}"
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}" # 오타 수정 완료
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
