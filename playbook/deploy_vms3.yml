@@ -1,19 +1,20 @@
 ---
-- name: Proxmox VM 일괄 생성 (사양 승계 및 설문 반영)
+- name: Proxmox VM 일괄 생성 (사양 승계 및 대기 로직 보완)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 설문 변수 데이터 정제
+    # 설문 변수 정제
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
-    prefix: "{{ survey_vm_name_prefix | default('KFE-VM') }}"
+    # prefix 끝에 하이픈이 있을 경우를 대비해 trim 처리
+    clean_prefix: "{{ survey_vm_name_prefix | default('KFE-VM') | regex_replace('-$', '') }}"
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
     
     # 템플릿 선택 및 ID 추출
     raw_template: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) | trim }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
     
-    # 설문에서 선택한 VNet 정보 반영
+    # 설문 VNet 반영
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
 
   tasks:
@@ -22,7 +23,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] VM 복제 생성 (템플릿 사양 기반)"
+    - name: "[단계 1] VM 복제 생성 (사양 승계 모드)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -30,41 +31,21 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 원본 노드 지정 (템플릿 위치)
         node: "xxhci00"   
         vmid: "{{ template_id }}"
         target: "{{ target_node }}"
-        name: "{{ prefix }}-{{ item }}"
+        name: "{{ clean_prefix }}-{{ item }}" # 하이픈 중복 방지
         
-        # [핵심] Full Clone을 통해 템플릿의 모든 사양을 기본적으로 가져옵니다.
         full: true 
         timeout: 1800 
         
-        # [수정] 설문에서 선택한 네트워크만 명시적으로 업데이트합니다.
-        # CPU, 메모리 등의 파라미터를 삭제하여 템플릿 사양이 덮어씌워지지 않도록 보호합니다.
+        # [핵심] 사양 파라미터를 제외하여 템플릿의 8코어/8GB/VirtIO 설정을 그대로 승계함
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
-          
         state: present
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
 
-    - name: "[대기] 복제 완료 및 VM 등록 확인"
-      community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
-        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
-        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        api_host: "{{ lookup('env', 'PROXMO tax_URL') | regex_replace('https://|:8006', '') }}"
-        validate_certs: false
-        node: "{{ target_node }}"
-        name: "{{ prefix }}-{{ item }}"
-        state: present
-      register: vm_check
-      until: vm_check is success
-      retries: 30
-      delay: 15
-      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
-
-    - name: "[단계 2] 신규 VM 전원 켜기"
+    - name: "[대기] 복제 프로세스 완료 대기 (이름 기반 검색)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -72,6 +53,22 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         node: "{{ target_node }}"
-        name: "{{ prefix }}-{{ item }}"
+        name: "{{ clean_prefix }}-{{ item }}"
+      register: vm_status
+      # 템플릿 사양을 승계한 VM이 리스트에 나타날 때까지 대기
+      until: vm_status.failed is not defined or not vm_status.failed
+      retries: 50
+      delay: 20 # 128GB 복제를 고려하여 간격을 늘림
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    - name: "[단계 2] 복제 완료된 신규 VM 부팅"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "{{ clean_prefix }}-{{ item }}"
         state: started
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
