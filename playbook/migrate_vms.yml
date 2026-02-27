@@ -1,0 +1,172 @@
+---
+- name: Proxmox VM 지능형 마이그레이션 (부하 분산 적용)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # 설문조사 변수 (AWX 설정에 맞게 변수명을 매핑해주세요)
+    survey_vm_ids: "{{ survey_target_vms | default('') }}"
+    survey_target_nodes: "{{ survey_target_hosts | default('') }}"
+
+  tasks:
+    - name: "[준비] 필수 라이브러리 설치"
+      pip:
+        name: [proxmoxer, requests]
+        state: present
+
+    - name: "[분석] 대상 VM 위치 확인 및 타겟 노드 부하 분석"
+      shell: |
+        {{ ansible_python_interpreter | default('python3') }} -c "
+        import os, json, urllib3
+        from proxmoxer import ProxmoxAPI
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        raw_vms = '{{ survey_vm_ids }}'
+        raw_nodes = '{{ survey_target_nodes }}'
+        
+        target_vmid_list = [v.strip() for v in raw_vms.split(',') if v.strip().isdigit()]
+        
+        # 다중 선택된 타겟 노드 리스트 파싱 (JSON 배열 형태나 쉼표 문자열 모두 대응)
+        cleaned_nodes = raw_nodes.replace('[', '').replace(']', '').replace('\'', '').replace('\"', '')
+        target_node_list = [n.strip() for n in cleaned_nodes.split(',') if n.strip()]
+
+        migration_plan = []
+        skipped_plan = []
+
+        try:
+            url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
+            user = os.environ.get('PROXMOX_USER', '')
+            token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
+            token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
+
+            proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
+
+            # 1. 클러스터 전체 리소스를 스캔하여 노드별 VM 수량과 원본 위치 파악
+            resources = proxmox.cluster.resources.get()
+            node_vm_count = {}
+            vms_info = {}
+            
+            for res in resources:
+                if res.get('type') == 'vm':
+                    node = res.get('node')
+                    vmid = str(res.get('vmid'))
+                    node_vm_count[node] = node_vm_count.get(node, 0) + 1
+                    if vmid in target_vmid_list:
+                        vms_info[vmid] = {'node': node, 'name': res.get('name')}
+
+            # 2. 선택된 타겟 노드들의 상태(CPU, RAM, VM수량) 분석
+            nodes = proxmox.nodes.get()
+            available_targets = []
+            
+            for n in nodes:
+                node_name = n.get('node')
+                if node_name in target_node_list and n.get('status') == 'online':
+                    mem_pct = n.get('mem', 0) / n.get('maxmem', 1) if n.get('maxmem', 0) > 0 else 1.0
+                    cpu_pct = n.get('cpu', 1.0)
+                    vm_count_weight = node_vm_count.get(node_name, 0) * 0.05  # VM 1개당 5% 부하 가중치 부여
+                    
+                    # 통합 부하 스코어 (낮을수록 한가함)
+                    score = mem_pct + cpu_pct + vm_count_weight
+                    available_targets.append({'node': node_name, 'score': score})
+
+            # 부하가 적은 순으로 정렬
+            available_targets.sort(key=lambda x: x['score'])
+
+            # 3. 마이그레이션 대상별 최적의 노드 할당
+            for vmid in target_vmid_list:
+                if vmid not in vms_info:
+                    skipped_plan.append({'vmid': vmid, 'reason': '클러스터에서 VM을 찾을 수 없음'})
+                    continue
+                    
+                src_node = vms_info[vmid]['node']
+                vm_name = vms_info[vmid]['name']
+                
+                if not available_targets:
+                    skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': '사용 가능한 타겟 노드 없음'})
+                    continue
+
+                # 가장 부하가 적은 1등 노드 선택
+                best_target = available_targets[0]
+                dest_node = best_target['node']
+
+                # 이미 타겟 노드에 있으면 건너뜀
+                if src_node == dest_node:
+                    skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': f'이미 목적지({dest_node})에 위치함'})
+                    continue
+
+                migration_plan.append({
+                    'vmid': vmid,
+                    'name': vm_name,
+                    'source_node': src_node,
+                    'target_node': dest_node
+                })
+                
+                # [핵심] 할당된 노드에 가상의 부하(0.5)를 더해 다음 VM은 다른 노드로 분산되도록 유도
+                best_target['score'] += 0.5 
+                available_targets.sort(key=lambda x: x['score'])
+
+            print(json.dumps({
+                'migration_plan': migration_plan,
+                'skipped_plan': skipped_plan
+            }))
+            
+        except Exception as e:
+            print(json.dumps({'error': str(e), 'migration_plan': [], 'skipped_plan': []}))
+        "
+      register: migration_analysis_raw
+      changed_when: false
+
+    - name: "[변수 설정] 마이그레이션 계획 적용"
+      set_fact:
+        migration_plan: "{{ (migration_analysis_raw.stdout | from_json).migration_plan | default([]) }}"
+        skipped_plan: "{{ (migration_analysis_raw.stdout | from_json).skipped_plan | default([]) }}"
+
+    - name: "[알림] 지능형 마이그레이션 계획 요약"
+      debug:
+        msg: |
+          ============================================================
+          🚀 [이동 승인] 마이그레이션 계획:
+          {% for item in migration_plan %}
+          - {{ item.vmid }} ({{ item.name }}) : [{{ item.source_node }}] ➡️ [{{ item.target_node }}]
+          {% else %}
+          - 진행할 대상 없음
+          {% endfor %}
+          
+          ⏭️ [안전 건너뜀] 예외 처리:
+          {% for item in skipped_plan %}
+          - {{ item.vmid }} ({{ item.name | default('Unknown') }}) : {{ item.reason }}
+          {% else %}
+          - 없음
+          {% endfor %}
+          ============================================================
+
+    - name: "[단계 1] 백그라운드 마이그레이션 실행 (무중단/비동기)"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        
+        node: "{{ item.source_node }}"
+        vmid: "{{ item.vmid }}"
+        target: "{{ item.target_node }}"
+        
+        # [핵심] 복제가 아닌 마이그레이션 명령어 호출
+        migrate: true
+        
+      loop: "{{ migration_plan }}"
+      when: migration_plan | length > 0
+      async: 3600
+      poll: 0
+      register: migrate_jobs
+
+    - name: "[대기] 마이그레이션 진행 상태 모니터링 (15초 주기 생존 신고)"
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 240
+      delay: 15
+      loop: "{{ migrate_jobs.results | default([]) }}"
+      when: migrate_jobs.results is defined
