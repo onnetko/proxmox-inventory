@@ -4,15 +4,15 @@
   gather_facts: false
 
   vars:
-    # 설문 변수: 템플릿과 개수만 정확히 처리
+    # 설문에서 받은 값을 숫자로 안전하게 변환
+    vm_count_int: "{{ (survey_vm_count | default(1)) | int }}"
+    
+    # 템플릿 이름에서 ID 추출
     raw_template: "{{ survey_template_name | default('106') }}"
     template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
-    
-    # [교정] 숫자로 확실하게 변환하여 루프 오류 방지
-    vm_count: "{{ (survey_vm_count | default(1)) | int }}"
 
   tasks:
-    - name: "[단계 1] VM 복제 생성 (사양 100% 승계)"
+    - name: "[단계 1] VM 복제 생성 (하드웨어 승계 보장)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -20,17 +20,17 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 템플릿이 있는 노드에서 복제 실행
+        # 템플릿이 위치한 노드
         node: "xxhci00"
         vmid: "{{ template_id }}"
         target: "xxhci01"
         name: "KFE-VM-{{ item }}"
         full: true
         state: present
-      # vm_count를 확실한 숫자로 계산
-      loop: "{{ range(1, vm_count + 1) | list }}"
+      # 숫자로 변환된 변수를 사용하여 루프 실행 [cite: 2026-02-28]
+      loop: "{{ range(1, vm_count_int + 1) | list }}"
 
-    - name: "[단계 2] 복제된 VM 전원 켜기"
+    - name: "[단계 2] 생성된 VM 전원 켜기"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -40,4 +40,4 @@
         node: "xxhci01"
         name: "KFE-VM-{{ item }}"
         state: started
-      loop: "{{ range(1, vm_count + 1) | list }}"
+      loop: "{{ range(1, vm_count_int + 1) | list }}"
