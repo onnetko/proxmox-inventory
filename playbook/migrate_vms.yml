@@ -1,10 +1,9 @@
 ---
-- name: Proxmox VM 지능형 마이그레이션 (부하 분산 및 최종 검증)
+- name: Proxmox VM 지능형 마이그레이션 (실시간 위치 추적 검증형)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # AWX 설문조사 변수 (사용자 입력값)
     survey_vm_ids: "{{ survey_target_vms | default('') }}"
     survey_target_nodes: "{{ survey_target_hosts | default('') }}"
 
@@ -15,7 +14,6 @@
         state: present
 
     - name: "[분석] 최적 분산 배치 계획 수립"
-      # 따옴표 충돌 방지를 위해 환경 변수 사용
       environment:
         ENV_RAW_VMS: "{{ survey_vm_ids }}"
         ENV_RAW_NODES: "{{ survey_target_nodes | string }}"
@@ -41,7 +39,6 @@
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 리소스를 가져올 때 qemu(VM)와 lxc(컨테이너) 모두 포함
             resources = proxmox.cluster.resources.get(type='vm')
             node_vm_count = {}
             vms_info = {}
@@ -53,7 +50,6 @@
                     if vmid in target_vmid_list:
                         vms_info[vmid] = {'node': node, 'name': res.get('name')}
 
-            # 타겟 노드 부하 분석 (CPU + RAM + VM수량 가중치)
             nodes = proxmox.nodes.get()
             available_targets = []
             for n in nodes:
@@ -97,17 +93,7 @@
       set_fact:
         migration_plan: "{{ (migration_analysis_raw.stdout | from_json).migration_plan | default([]) }}"
 
-    - name: "[알림] 지능형 마이그레이션 배치 계획"
-      debug:
-        msg: |
-          ============================================================
-          🚀 [이동 승인] 계획:
-          {% for item in migration_plan %}
-          - {{ item.vmid }} ({{ item.name }}) : [{{ item.source_node }}] ➡️ [{{ item.target_node }}]
-          {% endfor %}
-          ============================================================
-
-    - name: "[단계 1] 마이그레이션 실행 (무중단 API 호출)"
+    - name: "[단계 1] 마이그레이션 실행 (API 무중단 호출)"
       uri:
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/qemu/{{ item.vmid }}/migrate"
         method: POST
@@ -119,21 +105,9 @@
         status_code: 200
       loop: "{{ migration_plan }}"
       when: migration_plan | length > 0
-      async: 3600
-      poll: 0
-      register: migrate_jobs
+      register: api_responses
 
-    - name: "[단계 2] 작업 완료 대기 (백그라운드 모니터링)"
-      async_status:
-        jid: "{{ item.ansible_job_id }}"
-      register: job_result
-      until: job_result.finished
-      retries: 240
-      delay: 15
-      loop: "{{ migrate_jobs.results | default([]) }}"
-      when: item.ansible_job_id is defined
-
-    - name: "[단계 3] 최종 위치 및 상태 검증 (동기화 대기 포함)"
+    - name: "[단계 2] 실시간 위치 추적 및 최종 검증 (최대 10분 추적)"
       environment:
         ENV_MIGRATION_PLAN: "{{ migration_plan | to_json }}"
       shell: |
@@ -142,41 +116,56 @@
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        plan_str = os.environ.get('ENV_MIGRATION_PLAN', '[]')
-        plan = json.loads(plan_str)
-        results = []
-
+        plan = json.loads(os.environ.get('ENV_MIGRATION_PLAN', '[]'))
+        
         url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
         user = os.environ.get('PROXMOX_USER', '')
         token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
         token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-        # [핵심 교정] 마이그레이션 완료 후 클러스터 정보 반영을 위해 10초간 대기합니다.
-        time.sleep(10)
-
-        resources = proxmox.cluster.resources.get(type='vm')
-        current_vms = {str(r.get('vmid')): r.get('node') for r in resources if r.get('type') in ['qemu', 'lxc']}
-
-        for p in plan:
-            vmid = str(p['vmid'])
-            target = p['target_node']
-            actual = current_vms.get(vmid, 'N/A')
-            status = '✅ 성공' if target == actual else '❌ 실패(또는 지연)'
-            results.append(f'- VM {vmid} ({p[\"name\"]}): {status} (목표: {target} / 현재: {actual})')
+        results = []
+        # 이동이 완료될 때까지 기다릴 대상들
+        pending_vms = {p['vmid']: p for p in plan}
         
-        if results:
-            print('\n'.join(results))
+        # 최대 60번 (10초 간격 = 총 10분) 시도
+        for attempt in range(60):
+            resources = proxmox.cluster.resources.get(type='vm')
+            current_vms = {str(r.get('vmid')): r.get('node') for r in resources if r.get('type') in ['qemu', 'lxc']}
+            
+            # 계획된 VM들이 목표 노드에 도착했는지 체크
+            finished_in_this_round = []
+            for vmid, p in pending_vms.items():
+                if current_vms.get(vmid) == p['target_node']:
+                    results.append(f'- VM {vmid} ({p[\"name\"]}): ✅ 성공 (현재 위치: {p[\"target_node\"]})')
+                    finished_in_this_round.append(vmid)
+            
+            # 완료된 건 제외
+            for vmid in finished_in_this_round:
+                del pending_vms[vmid]
+            
+            # 모두 완료되었으면 루프 종료
+            if not pending_vms:
+                break
+            
+            time.sleep(10) # 10초 대기 후 재조회
+
+        # 10분이 지나도 못 옮겨진 건 실패 처리
+        for vmid, p in pending_vms.items():
+            actual = current_vms.get(vmid, 'N/A')
+            results.append(f'- VM {vmid} ({p[\"name\"]}): ❌ 실패 (목표: {p[\"target_node\"]} / 현재: {actual})')
+
+        print('\n'.join(results))
         "
       register: final_report
       when: migration_plan | length > 0
       changed_when: false
 
-    - name: "[완료] 마이그레이션 최종 처리 결과 리포트"
+    - name: "[완료] 마이그레이션 최종 결과 확인"
       debug:
         msg: |
           ============================================================
-          📊 마이그레이션 최종 처리 결과 (10초 대기 후 검증 완료)
+          📊 마이그레이션 최종 처리 결과 (실시간 추적 완료)
           ============================================================
           {{ final_report.stdout | default('진행된 마이그레이션이 없습니다.') }}
           ============================================================
