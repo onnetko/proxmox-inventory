@@ -14,7 +14,6 @@
         state: present
 
     - name: "[분석] 대상 VM 위치 확인 및 타겟 노드 부하 분석"
-      # [핵심 교정 1] 따옴표 충돌을 막기 위해 AWX 설문 변수를 환경 변수로 안전하게 넘깁니다.
       environment:
         ENV_RAW_VMS: "{{ survey_vm_ids }}"
         ENV_RAW_NODES: "{{ survey_target_nodes | string }}"
@@ -24,7 +23,6 @@
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        # 환경 변수에서 안전하게 값을 받아옵니다.
         raw_vms = os.environ.get('ENV_RAW_VMS', '')
         raw_nodes = os.environ.get('ENV_RAW_NODES', '')
         
@@ -44,12 +42,14 @@
 
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            resources = proxmox.cluster.resources.get()
+            # API 호출 시 type='vm'으로 필터링하여 가져옵니다.
+            resources = proxmox.cluster.resources.get(type='vm')
             node_vm_count = {}
             vms_info = {}
             
             for res in resources:
-                if res.get('type') == 'vm':
+                # [핵심 교정] Proxmox 내부 타입명인 'qemu' 또는 'lxc'로 정확하게 매칭합니다.
+                if res.get('type') in ['qemu', 'lxc']:
                     node = res.get('node')
                     vmid = str(res.get('vmid'))
                     node_vm_count[node] = node_vm_count.get(node, 0) + 1
@@ -136,7 +136,6 @@
           ============================================================
 
     - name: "[단계 1] 백그라운드 마이그레이션 실행 (API 무중단 호출)"
-      # [핵심 교정 2] 모듈의 한계를 피해 Proxmox API를 직접 호출하여 완벽한 Live Migration을 수행합니다.
       uri:
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/qemu/{{ item.vmid }}/migrate"
         method: POST
@@ -150,8 +149,6 @@
         status_code: 200
       loop: "{{ migration_plan }}"
       when: migration_plan | length > 0
-      
-      # 비동기 병렬 처리로 AWX 화면 멈춤을 방지합니다.
       async: 3600
       poll: 0
       register: migrate_jobs
