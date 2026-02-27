@@ -1,11 +1,14 @@
 ---
-- name: Proxmox VM 일괄 생성 (ISO 에러 우회 및 장치 복구)
+- name: Proxmox VM 일괄 생성 (진짜 Clone 로직 적용본)
   hosts: localhost
   gather_facts: false
 
   vars:
-    raw_template: "{{ survey_template_name | default('106') }}"
-    template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
+    # 설문에서 넘어온 값 (예: "106 (Rocky10.0-Default)")에서 이름만 추출합니다.
+    # 복제 파라미터는 ID가 아닌 템플릿의 '이름'을 필요로 합니다.
+    raw_template: "{{ survey_template_name | default('Rocky10.0-Default') }}"
+    template_name: "{{ raw_template | regex_replace('^.*\\((.*)\\).*$', '\\1') | trim }}"
+    
     vm_count: "{{ (survey_vm_count | default(1)) | int }}"
     target_node: "xxhci01"
 
@@ -15,22 +18,26 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] 순수 복제 실행"
+    - name: "[단계 1] 템플릿 완벽 복제 실행"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
+        
         node: "xxhci00"
-        vmid: "{{ template_id }}"
+        
+        # [핵심 교정] vmid 대신 'clone' 파라미터를 사용하여 진짜 복제를 지시합니다.
+        clone: "{{ template_name }}"
+        
         target: "{{ target_node }}"
         name: "KFE-VM-{{ item }}"
         full: true
         state: present
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
 
-    - name: "[대기] 복제 완료 확인"
+    - name: "[대기] 복제 프로세스 완료 대기"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -45,43 +52,7 @@
       delay: 20
       loop: "{{ range(1, (vm_count | int) + 1) | list }}"
 
-    - name: "[단계 2] 누락된 하드웨어 장치 강제 재구성"
-      community.proxmox.proxmox_kvm:
-        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
-        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
-        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
-        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
-        validate_certs: false
-        node: "{{ target_node }}"
-        name: "KFE-VM-{{ item }}"
-        
-        update: true
-        
-        # 1. 기본 사양 강제 주입
-        cores: 8
-        memory: 8192
-        scsihw: virtio-scsi-pci
-        
-        # 2. EFI 및 TPM 복구
-        efidisk0: 
-          storage: "CephPool-VM-DMZ"
-          format: "raw"
-          efitype: "4m"
-        tpmstate0:
-          storage: "CephPool-VM-DMZ"
-          version: "2.0"
-
-        # 3. CD/DVD 및 네트워크 장치 복구
-        ide:
-          # [핵심] ISO 파일 연결 에러를 피하기 위해 '빈 CD-ROM(none)'으로 명시
-          ide2: "none,media=cdrom"
-        net:
-          net0: "virtio,bridge=VLAN222"
-        
-        state: present
-      loop: "{{ range(1, (vm_count | int) + 1) | list }}"
-
-    - name: "[단계 3] 교정된 VM 전원 켜기"
+    - name: "[단계 2] 복제 완료된 VM 전원 켜기"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
