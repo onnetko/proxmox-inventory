@@ -1,50 +1,40 @@
 ---
-- name: Proxmox VM 일괄 생성 (ID 다이렉트 매칭)
+- name: Proxmox VM 일괄 생성 (복제 대기 및 부팅 최적화)
   hosts: localhost
   gather_facts: false
 
   vars:
+    # 설문 변수 이름 규칙 보정
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
-    vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
+    # prefix가 없을 경우를 대비해 기본값 'KFE-VM' 지정
+    prefix: "{{ survey_vm_name_prefix | default('KFE-VM') }}"
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    # 템플릿의 숫자 ID를 정수형으로 정의
     template_id: 106 
 
   tasks:
-    - name: "[준비] 필수 파이썬 라이브러리(proxmoxer) 즉시 설치"
+    - name: "[준비] 필수 파이썬 라이브러리 설치"
       pip:
-        name: 
-          - proxmoxer
-          - requests
+        name: [proxmoxer, requests]
         state: present
 
-    - name: "[단계 1] VM 복제 생성 (VMID 기반)"
+    - name: "[단계 1] VM 복제 생성 (Full Clone)"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
         api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
-        
-        # 1. 템플릿이 위치한 노드
         node: "xxhci00"   
-        
-        # 2. [핵심] clone 대신 vmid 파라미터에 숫자 ID를 넣어 이름 매칭 버그 우회
         vmid: "{{ template_id }}"
-        
-        # 3. 생성될 대상 노드
         target: "{{ target_node }}"
-        name: "{{ vm_name_prefix }}-{{ item }}"
-        
-        # 4. Full Clone 및 충분한 타임아웃
+        # 이름 형식을 명확하게 지정 (예: KFE-VM-1)
+        name: "{{ prefix }}-{{ item }}"
         full: true 
         timeout: 1800 
-        
-        # 5. 오직 생성(present)만 수행하여 템플릿 실행 에러 방지
         state: present
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
 
-    - name: "[단계 2] 복제 완료된 신규 VM 부팅"
+    - name: "[대기] 복제 완료 및 VM 등록 확인"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -52,6 +42,23 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         node: "{{ target_node }}"
-        name: "{{ vm_name_prefix }}-{{ item }}"
+        name: "{{ prefix }}-{{ item }}"
+        state: present
+      register: vm_check
+      # VM이 클러스터에 나타날 때까지 10초마다 최대 30번 재시도 (5분)
+      until: vm_check is success
+      retries: 30
+      delay: 10
+      loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    - name: "[단계 2] 신규 VM 전원 켜기"
+      community.proxmox.proxmox_kvm:
+        api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
+        api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
+        api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
+        api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
+        validate_certs: false
+        node: "{{ target_node }}"
+        name: "{{ prefix }}-{{ item }}"
         state: started
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
