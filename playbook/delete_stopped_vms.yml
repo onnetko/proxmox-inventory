@@ -4,7 +4,7 @@
   gather_facts: false
 
   vars:
-    # AWX 설문에서 입력받은 VM ID 리스트 (예: "111, 112, 113")
+    # AWX 설문에서 입력받은 VM ID 리스트
     survey_vm_ids: "{{ survey_target_vms | default('') }}"
 
   tasks:
@@ -20,7 +20,6 @@
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        # 1. 입력받은 문자열을 리스트로 변환 (공백 제거 및 숫자만 추출)
         raw_ids = '{{ survey_vm_ids }}'
         target_ids = [vid.strip() for vid in raw_ids.split(',') if vid.strip().isdigit()]
 
@@ -36,14 +35,12 @@
 
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 2. 클러스터 전체 리소스를 스캔하여 타겟 VM 탐색
             for vm in proxmox.cluster.resources.get(type='vm'):
                 vmid = str(vm.get('vmid'))
                 if vmid in target_ids:
                     if vmid in not_found:
                         not_found.remove(vmid)
                     
-                    # 3. 전원 상태(status) 확인: 'stopped'인 경우만 삭제 대상으로 분류
                     if vm.get('status') == 'stopped':
                         to_delete.append({'vmid': vmid, 'node': vm.get('node'), 'name': vm.get('name')})
                     else:
@@ -70,11 +67,11 @@
     - name: "[알림] VM 삭제 진행 계획 요약"
       debug:
         msg: |
-          ==================================================
-          🗑️ [삭제 승인] 꺼져있는 VM: {{ vms_to_delete | map(attribute='vmid') | list }}
-          ⚠️ [보호 조치] 실행중인 VM: {{ vms_skipped | map(attribute='vmid') | list }} (안전을 위해 건너뜀)
-          ❌ [검색 실패] 없는 VM ID : {{ vms_not_found }}
-          ==================================================
+          ============================================================
+          [ 🗑️ 삭제 승인 ] 꺼져있는 VM  : {{ vms_to_delete | map(attribute='vmid') | join(', ') | default('없음', true) }}
+          [ ⚠️ 보호 조치 ] 실행중인 VM  : {{ vms_skipped | map(attribute='vmid') | join(', ') | default('없음', true) }} (안전 건너뜀)
+          [ ❌ 검색 실패 ] 없는 VM ID   : {{ vms_not_found | join(', ') | default('없음', true) }}
+          ============================================================
 
     - name: "[단계 1] 전원이 꺼진(Stopped) VM 일괄 삭제 실행"
       community.proxmox.proxmox_kvm:
@@ -84,13 +81,9 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        # 스크립트가 찾아낸 정확한 노드와 ID를 주입하여 삭제
         node: "{{ item.node }}"
         vmid: "{{ item.vmid }}"
-        
-        # [핵심] state를 absent로 주어 가상머신을 삭제합니다.
         state: absent
       
       loop: "{{ vms_to_delete }}"
-      # 삭제할 VM이 있을 때만 이 태스크를 실행합니다.
       when: vms_to_delete | length > 0
