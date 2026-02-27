@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 지능형 마이그레이션 (부하 분산 및 최종 검증 포함)
+- name: Proxmox VM 지능형 마이그레이션 (부하 분산 및 무중단 적용)
   hosts: localhost
   gather_facts: false
 
@@ -25,7 +25,9 @@
 
         raw_vms = os.environ.get('ENV_RAW_VMS', '')
         raw_nodes = os.environ.get('ENV_RAW_NODES', '')
+        
         target_vmid_list = [v.strip() for v in raw_vms.split(',') if v.strip().isdigit()]
+        
         cleaned_nodes = raw_nodes.replace('[', '').replace(']', '').replace('\'', '').replace('\"', '')
         target_node_list = [n.strip() for n in cleaned_nodes.split(',') if n.strip()]
 
@@ -37,11 +39,13 @@
             user = os.environ.get('PROXMOX_USER', '')
             token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
+
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
             resources = proxmox.cluster.resources.get(type='vm')
             node_vm_count = {}
             vms_info = {}
+            
             for res in resources:
                 if res.get('type') in ['qemu', 'lxc']:
                     node = res.get('node')
@@ -52,12 +56,14 @@
 
             nodes = proxmox.nodes.get()
             available_targets = []
+            
             for n in nodes:
                 node_name = n.get('node')
                 if node_name in target_node_list and n.get('status') == 'online':
                     mem_pct = n.get('mem', 0) / n.get('maxmem', 1) if n.get('maxmem', 0) > 0 else 1.0
                     cpu_pct = n.get('cpu', 1.0)
                     vm_count_weight = node_vm_count.get(node_name, 0) * 0.05
+                    
                     score = mem_pct + cpu_pct + vm_count_weight
                     available_targets.append({'node': node_name, 'score': score})
 
@@ -65,49 +71,79 @@
 
             for vmid in target_vmid_list:
                 if vmid not in vms_info:
-                    skipped_plan.append({'vmid': vmid, 'reason': '찾을 수 없음'})
+                    skipped_plan.append({'vmid': vmid, 'reason': '클러스터에서 VM을 찾을 수 없음'})
                     continue
+                    
                 src_node = vms_info[vmid]['node']
                 vm_name = vms_info[vmid]['name']
+                
                 if not available_targets:
-                    skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': '가용 노드 없음'})
-                    continue
-                best_target = available_targets[0]
-                dest_node = best_target['node']
-                if src_node == dest_node:
-                    skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': f'이미 {dest_node}에 있음'})
+                    skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': '사용 가능한 타겟 노드 없음'})
                     continue
 
-                migration_plan.append({'vmid': vmid, 'name': vm_name, 'source_node': src_node, 'target_node': dest_node})
+                best_target = available_targets[0]
+                dest_node = best_target['node']
+
+                if src_node == dest_node:
+                    skipped_plan.append({'vmid': vmid, 'name': vm_name, 'reason': f'이미 목적지({dest_node})에 위치함'})
+                    continue
+
+                migration_plan.append({
+                    'vmid': vmid,
+                    'name': vm_name,
+                    'source_node': src_node,
+                    'target_node': dest_node
+                })
+                
                 best_target['score'] += 0.5 
                 available_targets.sort(key=lambda x: x['score'])
 
-            print(json.dumps({'migration_plan': migration_plan, 'skipped_plan': skipped_plan}))
+            print(json.dumps({
+                'migration_plan': migration_plan,
+                'skipped_plan': skipped_plan
+            }))
+            
         except Exception as e:
             print(json.dumps({'error': str(e), 'migration_plan': [], 'skipped_plan': []}))
         "
       register: migration_analysis_raw
       changed_when: false
 
-    - name: "[변수 설정] 계획 수립"
+    - name: "[변수 설정] 마이그레이션 계획 적용"
       set_fact:
         migration_plan: "{{ (migration_analysis_raw.stdout | from_json).migration_plan | default([]) }}"
 
-    - name: "[단계 1] 마이그레이션 실행 (비동기)"
+    - name: "[알림] 지능형 마이그레이션 계획 요약"
+      debug:
+        msg: |
+          ============================================================
+          🚀 [이동 승인] 마이그레이션 계획:
+          {% for item in migration_plan %}
+          - {{ item.vmid }} ({{ item.name }}) : [{{ item.source_node }}] ➡️ [{{ item.target_node }}]
+          {% else %}
+          - 진행할 대상 없음
+          {% endfor %}
+          ============================================================
+
+    - name: "[단계 1] 마이그레이션 실행 (API 무중단 호출)"
       uri:
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/qemu/{{ item.vmid }}/migrate"
         method: POST
         headers:
           Authorization: "PVEAPIToken={{ lookup('env', 'PROXMOX_USER') }}!{{ lookup('env', 'PROXMOX_TOKEN_ID') }}={{ lookup('env', 'PROXMOX_TOKEN_SECRET') }}"
         body_format: form-urlencoded
-        body: { target: "{{ item.target_node }}", online: 1 }
+        body:
+          target: "{{ item.target_node }}"
+          online: 1
         validate_certs: false
+        status_code: 200
       loop: "{{ migration_plan }}"
+      when: migration_plan | length > 0
       async: 3600
       poll: 0
       register: migrate_jobs
 
-- name: "[단계 2] 완료 대기"
+    - name: "[단계 2] 완료 대기"
       async_status:
         jid: "{{ item.ansible_job_id }}"
       register: job_result
@@ -118,7 +154,6 @@
       when: item.ansible_job_id is defined
 
     - name: "[단계 3] 최종 위치 및 상태 검증 리포트"
-      # [교정] 데이터를 환경 변수로 넘겨 특수 문자 충돌을 원천 차단합니다.
       environment:
         ENV_MIGRATION_PLAN: "{{ migration_plan | to_json }}"
       shell: |
@@ -127,7 +162,6 @@
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        # 1. 환경 변수에서 안전하게 계획 데이터 로드
         plan_str = os.environ.get('ENV_MIGRATION_PLAN', '[]')
         plan = json.loads(plan_str)
         results = []
@@ -139,7 +173,6 @@
         
         proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-        # 2. Proxmox DB가 업데이트될 시간을 아주 잠깐(2초) 기다립니다.
         time.sleep(2)
 
         resources = proxmox.cluster.resources.get(type='vm')
@@ -154,8 +187,6 @@
         
         if results:
             print('\n'.join(results))
-        else:
-            print('분석된 결과가 없습니다.')
         "
       register: final_report
       when: migration_plan | length > 0
