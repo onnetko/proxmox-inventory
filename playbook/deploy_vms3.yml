@@ -1,5 +1,5 @@
 ---
-- name: Proxmox VM 일괄 생성 (템플릿 사양 유지 및 네트워크 반영)
+- name: Proxmox VM 일괄 생성 (템플릿 선택 기능 추가)
   hosts: localhost
   gather_facts: false
 
@@ -8,15 +8,23 @@
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
     prefix: "{{ survey_vm_name_prefix | default('KFE-VM') }}"
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    # 설문에서 선택한 VNet 정보 (예: VLAN222)
+    
+    # [추가] 설문에서 선택한 템플릿 이름 (예: "106 (Rocky10.0-Default)")
+    raw_template: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) | trim }}"
+    # 전체 이름에서 맨 앞의 숫자 ID만 추출하여 변수에 할당
+    template_id: "{{ raw_template | regex_replace('^(\\d+).*', '\\1') | int }}"
+    
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
-    template_id: 106 
 
   tasks:
     - name: "[준비] 필수 파이썬 라이브러리 설치"
       pip:
         name: [proxmoxer, requests]
         state: present
+
+    - name: "[확인] 선택된 템플릿 정보 디버깅"
+      debug:
+        msg: "선택된 템플릿: {{ raw_template }} (ID: {{ template_id }})"
 
     - name: "[단계 1] VM 복제 생성 (Full Clone)"
       community.proxmox.proxmox_kvm:
@@ -26,19 +34,17 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         node: "xxhci00"   
-        vmid: "{{ template_id }}"
+        vmid: "{{ template_id }}" # 추출된 ID 사용
         target: "{{ target_node }}"
         name: "{{ prefix }}-{{ item }}"
         full: true 
         timeout: 1800 
-        
-        # [수정] CPU/RAM 등 사양 파라미터를 제거하여 템플릿 값을 그대로 계승합니다.
-        # [반영] 설문 조사에서 선택한 네트워크 브리지 설정만 적용합니다.
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
-          
         state: present
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
+
+    # ... 이후 [대기] 및 [단계 2] 부팅 태스크는 이전과 동일 ...
 
     - name: "[대기] 복제 완료 및 VM 등록 확인"
       community.proxmox.proxmox_kvm:
