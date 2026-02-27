@@ -1,5 +1,5 @@
 ---
-- name: Proxmox 템플릿 기반 VM 일괄 생성 (파라미터 최종 교정)
+- name: Proxmox 템플릿 기반 VM 일괄 생성 (원본 노드 지정본)
   hosts: localhost
   gather_facts: false
 
@@ -12,9 +12,9 @@
     raw_vm_count: "{{ survey_vm_count | default('1') }}"
     vm_name_prefix: "{{ survey_vm_name_prefix | default('new-vm') }}"
     
-    # 리스트 처리 및 데이터 정제
+    # [교정] 데이터 정제
     target_node: "{{ (survey_target_node is iterable and survey_target_node is not string) | ternary(survey_target_node[0], survey_target_node) | default('xxhci01') }}"
-    template_full_name: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) }}"
+    template_full_name: "{{ (survey_template_name is iterable and survey_template_name is not string) | ternary(survey_template_name[0], survey_template_name) | trim }}"
     selected_spec: "{{ (survey_vm_spec is iterable and survey_vm_spec is not string) | ternary(survey_vm_spec[0], survey_vm_spec) }}"
     selected_vnet: "{{ (survey_vm_vnet is iterable and survey_vm_vnet is not string) | ternary(survey_vm_vnet[0], survey_vm_vnet) }}"
 
@@ -24,7 +24,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 및 자동 시작"
+    - name: "[생성] {{ raw_vm_count }}대의 VM 복제 시작"
       community.proxmox.proxmox_kvm:
         api_user: "{{ lookup('env', 'PROXMOX_USER') }}"
         api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') }}"
@@ -32,8 +32,12 @@
         api_host: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('https://|:8006', '') }}"
         validate_certs: false
         
-        node: "{{ target_node }}"
-        clone: "{{ template_full_name | trim }}" # 혹시 모를 앞뒤 공백 제거
+        # [핵심 수정] 원본 템플릿이 위치한 노드를 'node'에 쓰고, 
+        # 생성될 대상 노드를 'target'에 씁니다.
+        node: "xxhci00"   # 템플릿 106번이 실제로 있는 노드 (이미지 확인 결과)
+        clone: "{{ template_full_name }}"
+        target: "{{ target_node }}" # 실제 VM이 생성되어 실행될 노드 (xxhci03 등) [cite: 2026-02-28]
+        
         name: "{{ vm_name_prefix }}-{{ item }}"
         full: true
         timeout: 600
@@ -43,6 +47,5 @@
         net:
           net0: "virtio,bridge={{ selected_vnet }}"
         
-        # [수정] start: yes 대신 state: started를 사용하여 생성 후 즉시 실행
         state: started
       loop: "{{ range(1, (raw_vm_count | int) + 1) | list }}"
