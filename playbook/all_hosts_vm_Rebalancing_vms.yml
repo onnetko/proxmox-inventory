@@ -1,10 +1,10 @@
 ---
-- name: Proxmox 클러스터 전체 리밸런싱 (AWX 안전 제외 및 무결점 모니터링)
+- name: Proxmox 클러스터 전체 리밸런싱 (AWX 안전 제외 및 즉시 성공형)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 제외할 VM 이름 키워드 (기본값: awx). AWX 설문조사에서 여러 개를 쉼표(,)로 입력받을 수 있습니다.
+    # 제외할 VM 이름 키워드 (AWX 설문조사 변수 연동)
     exclude_keywords_input: "{{ survey_exclude_keywords | default('awx') }}"
 
   tasks:
@@ -13,7 +13,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[분석] 클러스터 전체 자원 스캔 및 최소 이동(로빈 후드) 리밸런싱 계획 수립"
+    - name: "[분석] 클러스터 전체 자원 스캔 및 최소 이동(로빈 후드) 계획 수립"
       environment:
         ENV_EXCLUDE_KEYWORDS: "{{ exclude_keywords_input }}"
       shell: |
@@ -22,7 +22,6 @@
         from proxmoxer import ProxmoxAPI
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        # 보호할 VM 키워드 (소문자로 변환하여 비교)
         raw_keywords = os.environ.get('ENV_EXCLUDE_KEYWORDS', 'awx')
         exclude_keywords = [k.strip().lower() for k in raw_keywords.split(',') if k.strip()]
 
@@ -33,52 +32,40 @@
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            # 온라인 상태인 호스트만 필터링
             online_nodes = [n['node'] for n in proxmox.nodes.get() if n.get('status') == 'online']
             node_inventory = {node: {'fixed': [], 'movable': []} for node in online_nodes}
 
-            # 실행 중인 모든 VM/LXC 분류 (고정 자산 vs 이동 가능 자산)
             for res in proxmox.cluster.resources.get(type='vm'):
                 if res.get('status') == 'running':
                     node = res.get('node')
                     if node not in node_inventory: continue
                     
                     name_lower = res.get('name', '').lower()
-                    is_excluded = any(kw in name_lower for kw in exclude_keywords)
-                    
-                    if is_excluded:
+                    if any(kw in name_lower for kw in exclude_keywords):
                         node_inventory[node]['fixed'].append(res)
                     else:
                         node_inventory[node]['movable'].append(res)
 
             plan = []
-            
-            # [핵심] 가장 여유로운 노드와 가장 붐비는 노드의 편차가 1 이하가 될 때까지 1개씩 재배치
             while True:
                 totals = []
                 for node, inv in node_inventory.items():
-                    total = len(inv['fixed']) + len(inv['movable'])
-                    totals.append({'node': node, 'total': total, 'movable_count': len(inv['movable'])})
+                    totals.append({
+                        'node': node, 
+                        'total': len(inv['fixed']) + len(inv['movable']), 
+                        'movable_count': len(inv['movable'])
+                    })
                     
                 totals.sort(key=lambda x: x['total'])
-                lowest = totals[0]
-                highest = totals[-1]
+                lowest, highest = totals[0], totals[-1]
                 
-                # 밸런싱이 완료되었거나(편차 1 이하) 더 이상 나눌 수 없으면 종료
                 if highest['total'] - lowest['total'] <= 1:
                     break
                     
-                # 가장 붐비는 노드들 중 '이동 가능한 VM'이 있는 노드 탐색
-                donor = None
-                for cand in reversed(totals):
-                    if cand['movable_count'] > 0 and (cand['total'] - lowest['total'] > 1):
-                        donor = cand
-                        break
-                        
+                donor = next((c for c in reversed(totals) if c['movable_count'] > 0 and (c['total'] - lowest['total'] > 1)), None)
                 if not donor:
-                    break # 남은 VM들이 모두 고정 자산(AWX 등)이라 이동 불가
+                    break 
                     
-                # 1대 이동
                 vm_to_move = node_inventory[donor['node']]['movable'].pop()
                 node_inventory[lowest['node']]['movable'].append(vm_to_move)
                 
@@ -97,7 +84,7 @@
       register: rebalance_analysis
       changed_when: false
 
-    - name: "[단계 1] 마이그레이션 명령 전송 (LXC/VM 최적화 분기)"
+    - name: "[단계 1] 마이그레이션 명령 전송 및 즉시 퇴근 (Proxmox 백그라운드 위임)"
       uri:
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/{{ item.type }}/{{ item.vmid }}/migrate"
         method: POST
@@ -112,7 +99,7 @@
       when: (rebalance_analysis.stdout | from_json).plan | length > 0
       register: api_responses
 
-    - name: "[오류 진단] 작업 생성 실패 여부 확인"
+    - name: "[오류 진단] API 명령 접수 확인"
       fail:
         msg: "명령 거부됨: {{ item.content }}"
       loop: "{{ api_responses.results | default([]) }}"
@@ -121,82 +108,13 @@
         - item.json.data is none or item.json.data == ""
         - not item.get('skipped', false)
 
-    - name: "[단계 2] 백그라운드 이동 상태 모니터링 (15초 주기 / 절대 성공 보장형)"
-      environment:
-        ENV_API_RESULTS: "{{ api_responses.results | default([]) | to_json }}"
-      shell: |
-        {{ ansible_python_interpreter | default('python3') }} -c "
-        import os, json, sys, time, urllib3
-        from proxmoxer import ProxmoxAPI
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-        try:
-            api_results = json.loads(os.environ.get('ENV_API_RESULTS', '[]'))
-            tasks = []
-            for r in api_results:
-                if 'json' in r and r['json'] and r['json'].get('data'):
-                    upid = r['json']['data']
-                    item = r.get('item', {})
-                    if upid.startswith('UPID') and item:
-                        tasks.append({
-                            'vmid': str(item.get('vmid')),
-                            'name': item.get('name', 'Unknown'),
-                            'node': item.get('source_node'),
-                            'upid': upid
-                        })
-
-            if not tasks:
-                print('✅ 클러스터가 이미 완벽하게 균형을 이루고 있거나, 이동할 대상이 없습니다.')
-                sys.exit(0)
-
-            url = os.environ.get('PROXMOX_URL', '').replace('https://', '').replace(':8006', '')
-            user = os.environ.get('PROXMOX_USER', '')
-            token_id = os.environ.get('PROXMOX_TOKEN_ID', '')
-            token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
-            proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
-
-            pending = { t['vmid']: t for t in tasks }
-            print(f'🚀 리밸런싱을 위해 총 {len(pending)}대의 리소스가 이동을 시작했습니다.')
-            sys.stdout.flush()
-
-            for attempt in range(1, 121):
-                done_this_round = []
-                for vmid, t in list(pending.items()):
-                    try:
-                        status_info = proxmox.nodes(t['node']).tasks(t['upid']).status.get()
-                        if status_info.get('status') == 'stopped':
-                            print(f'✅ [확인완료] {vmid} ({t["name"]}) 리밸런싱 안착 완료!')
-                            sys.stdout.flush()
-                            done_this_round.append(vmid)
-                    except Exception:
-                        pass
-                
-                for vmid in done_this_round:
-                    del pending[vmid]
-                    
-                if not pending:
-                    print('\n🎉 [완료] 클러스터 리밸런싱이 완벽하게 끝났습니다!')
-                    sys.exit(0)
-                    
-                time.sleep(15)
-
-            print('\n⚠️ 모니터링 시간이 초과되었으나, 마이그레이션은 안전하게 진행 중입니다. (성공 처리)')
-            sys.exit(0)
-
-        except Exception as e:
-            print(f'\n💡 [알림] 모니터링 중 예외 발생({e}). 작업은 성공 처리됩니다.')
-            sys.exit(0)
-        "
-      register: live_tracking
-      when: api_responses.results is defined and (api_responses.results | selectattr('json.data', 'defined') | list | length) > 0
-      failed_when: false
-      changed_when: false
-
-    - name: "[완료] 리밸런싱 최종 결과 보고"
+    - name: "[완료] 리밸런싱 지시 성공 리포트"
       debug:
         msg: |
           ============================================================
-          ⚖️ Proxmox 클러스터 리밸런싱 결과 리포트 (AWX 보호됨)
+          ✅ 리밸런싱 명령 전송 완료 (AWX 작업 성공)
           ============================================================
-          {{ live_tracking.stdout | default('이동할 대상이 없었거나 이미 균형 상태입니다.') }}
+          모든 최적화 이동 명령이 Proxmox 클러스터로 성공적으로 전달되었습니다.
+          이제 Proxmox가 백그라운드에서 안전하게 데이터 이동을 수행합니다.
+          진행 상황은 Proxmox 웹 UI 하단의 'Task History'에서 확인하세요.
           ============================================================
