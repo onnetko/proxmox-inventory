@@ -1,10 +1,10 @@
 ---
-- name: Proxmox 클러스터 전체 리밸런싱 (AWX 안전 제외 및 즉시 성공형)
+- name: Proxmox 지능형 자원 리밸런싱 (CPU+RAM 기반 / AWX 보호)
   hosts: localhost
   gather_facts: false
 
   vars:
-    # 제외할 VM 이름 키워드 (AWX 설문조사 변수 연동)
+    # 보호할 VM 이름 키워드 (기본값: awx). 대소문자를 구분하지 않습니다.
     exclude_keywords_input: "{{ survey_exclude_keywords | default('awx') }}"
 
   tasks:
@@ -13,7 +13,7 @@
         name: [proxmoxer, requests]
         state: present
 
-    - name: "[분석] 클러스터 전체 자원 스캔 및 최소 이동(로빈 후드) 계획 수립"
+    - name: "[분석] CPU 및 RAM 부하 기반 리밸런싱 시뮬레이션 수행"
       environment:
         ENV_EXCLUDE_KEYWORDS: "{{ exclude_keywords_input }}"
       shell: |
@@ -32,48 +32,67 @@
             token_secret = os.environ.get('PROXMOX_TOKEN_SECRET', '')
             proxmox = ProxmoxAPI(url, user=user, token_name=token_id, token_value=token_secret, verify_ssl=False)
 
-            online_nodes = [n['node'] for n in proxmox.nodes.get() if n.get('status') == 'online']
-            node_inventory = {node: {'fixed': [], 'movable': []} for node in online_nodes}
+            # 1. 온라인 노드들의 현재 CPU/RAM 부하 스코어 계산
+            nodes_raw = proxmox.nodes.get()
+            node_stats = {}
+            for n in nodes_raw:
+                if n.get('status') == 'online':
+                    mem_ratio = float(n.get('mem', 0)) / float(n.get('maxmem', 1))
+                    cpu_ratio = float(n.get('cpu', 0))
+                    node_stats[n['node']] = {
+                        'score': mem_ratio + cpu_ratio,
+                        'maxmem': float(n.get('maxmem', 1)),
+                        'movable_vms': []
+                    }
 
-            for res in proxmox.cluster.resources.get(type='vm'):
+            # 2. 실행 중인 자원 스캔 및 AWX 보호 (고정 자산 제외)
+            resources = proxmox.cluster.resources.get(type='vm')
+            for res in resources:
                 if res.get('status') == 'running':
                     node = res.get('node')
-                    if node not in node_inventory: continue
-                    
-                    name_lower = res.get('name', '').lower()
-                    if any(kw in name_lower for kw in exclude_keywords):
-                        node_inventory[node]['fixed'].append(res)
-                    else:
-                        node_inventory[node]['movable'].append(res)
+                    if node in node_stats:
+                        name_lower = res.get('name', '').lower()
+                        if not any(kw in name_lower for kw in exclude_keywords):
+                            node_stats[node]['movable_vms'].append(res)
 
+            # 3. 부하 분산 시뮬레이션 루프 (최대 50회 제한으로 무한 루프 방지)
             plan = []
-            while True:
-                totals = []
-                for node, inv in node_inventory.items():
-                    totals.append({
-                        'node': node, 
-                        'total': len(inv['fixed']) + len(inv['movable']), 
-                        'movable_count': len(inv['movable'])
-                    })
-                    
-                totals.sort(key=lambda x: x['total'])
-                lowest, highest = totals[0], totals[-1]
+            for _ in range(50):
+                # 점수 오름차순 정렬 (0번째가 가장 널널함, 마지막이 가장 부하 심함)
+                sorted_nodes = sorted(node_stats.items(), key=lambda x: x[1]['score'])
+                lowest_node, lowest_data = sorted_nodes[0]
                 
-                if highest['total'] - lowest['total'] <= 1:
+                # 가장 부하가 심하면서 '이동 가능한 VM'을 가진 노드 찾기
+                donor_idx = -1
+                for i in range(len(sorted_nodes)-1, -1, -1):
+                    if sorted_nodes[i][1]['movable_vms']:
+                        donor_idx = i
+                        break
+                
+                if donor_idx <= 0:
+                    break # 더 이상 옮길 VM이 없거나 완벽히 균형 잡힘
+                    
+                highest_node, highest_data = sorted_nodes[donor_idx]
+
+                # 가장 높은 노드와 가장 낮은 노드의 부하 차이가 10% 미만이면 종료
+                if highest_data['score'] - lowest_data['score'] < 0.10:
                     break
-                    
-                donor = next((c for c in reversed(totals) if c['movable_count'] > 0 and (c['total'] - lowest['total'] > 1)), None)
-                if not donor:
-                    break 
-                    
-                vm_to_move = node_inventory[donor['node']]['movable'].pop()
-                node_inventory[lowest['node']]['movable'].append(vm_to_move)
+
+                # VM 하나 추출 및 해당 VM의 부하 가중치 계산
+                vm_to_move = highest_data['movable_vms'].pop()
+                vm_mem = float(vm_to_move.get('mem', 0))
+                vm_cpu_weight = float(vm_to_move.get('cpu', 0))
                 
+                # 출발지 점수 차감
+                highest_data['score'] -= ((vm_mem / highest_data['maxmem']) + vm_cpu_weight)
+                # 목적지 점수 증가 (목적지의 전체 메모리 기준으로 비율 재계산)
+                lowest_data['score'] += ((vm_mem / lowest_data['maxmem']) + vm_cpu_weight)
+
                 plan.append({
                     'vmid': str(vm_to_move['vmid']),
                     'name': vm_to_move['name'],
-                    'source_node': donor['node'],
-                    'target_node': lowest['node'],
+                    'source_node': highest_node,
+                    'target_node': lowest_node,
                     'type': vm_to_move['type']
                 })
 
@@ -84,7 +103,7 @@
       register: rebalance_analysis
       changed_when: false
 
-    - name: "[단계 1] 마이그레이션 명령 전송 및 즉시 퇴근 (Proxmox 백그라운드 위임)"
+    - name: "[단계 1] 마이그레이션 명령 전송 및 즉시 종료 (Proxmox 백그라운드 위임)"
       uri:
         url: "{{ lookup('env', 'PROXMOX_URL') | regex_replace('/$', '') }}/api2/json/nodes/{{ item.source_node }}/{{ item.type }}/{{ item.vmid }}/migrate"
         method: POST
@@ -108,13 +127,13 @@
         - item.json.data is none or item.json.data == ""
         - not item.get('skipped', false)
 
-    - name: "[완료] 리밸런싱 지시 성공 리포트"
+    - name: "[완료] 리밸런싱 지시 완료 리포트"
       debug:
         msg: |
           ============================================================
-          ✅ 리밸런싱 명령 전송 완료 (AWX 작업 성공)
+          ⚖️ 클러스터 자원 기반 리밸런싱 명령 전송 완료 (AWX 보호)
           ============================================================
-          모든 최적화 이동 명령이 Proxmox 클러스터로 성공적으로 전달되었습니다.
-          이제 Proxmox가 백그라운드에서 안전하게 데이터 이동을 수행합니다.
-          진행 상황은 Proxmox 웹 UI 하단의 'Task History'에서 확인하세요.
+          총 {{ (rebalance_analysis.stdout | from_json).plan | length | default(0) }}대의 가상머신/컨테이너 이동 명령이 전달되었습니다.
+          AWX는 성공적으로 작업을 마치고 연결을 종료합니다.
+          실제 데이터 전송은 Proxmox가 백그라운드에서 안전하게 수행합니다.
           ============================================================
