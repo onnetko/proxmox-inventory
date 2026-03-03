@@ -1,0 +1,8 @@
+plugin: netbox.netbox.nb_inventory
+validate_certs: False
+group_by:
+  - sites
+  - platforms
+  - device_roles
+query_filters:
+  - status: active
